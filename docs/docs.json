@@ -65,6 +65,12 @@
               "guides/agent-developer/handling-approvals",
               "guides/agent-developer/cost-reporting"
             ]
+          },
+          {
+            "group": "Conventions",
+            "pages": [
+              "conventions/diarization"
+            ]
           }
         ]
       },

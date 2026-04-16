@@ -84,6 +84,9 @@ Prefer additive updates. Keep `doc/SPEC.md` and `doc/SPEC-implementation.md` ali
 5. Keep repo plan docs dated and centralized.
 When you are creating a plan file in the repository itself, new plan documents belong in `doc/plans/` and should use `YYYY-MM-DD-slug.md` filenames. This does not replace Paperclip issue planning: if a Paperclip issue asks for a plan, update the issue `plan` document per the `paperclip` skill instead of creating a repo markdown file.
 
+6. Diarize recurring entities, not one-off work.
+When context about an entity (client, competitor, long-running project, agent self-profile) will be read by ≥3 agents or across ≥3 heartbeats, write a structured profile via the [`paperclip-diarize`](skills/paperclip-diarize/SKILL.md) skill instead of re-deriving it from threads. Full rules: [`docs/conventions/diarization.md`](docs/conventions/diarization.md).
+
 ## 6. Database Change Workflow
 
 When changing data model:
