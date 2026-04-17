@@ -27,6 +27,7 @@ export function Activity() {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const [filter, setFilter] = useState("all");
+  const [actorFilter, setActorFilter] = useState("all");
 
   useEffect(() => {
     setBreadcrumbs([{ label: "Activity" }]);
@@ -94,6 +95,26 @@ export function Activity() {
     return map;
   }, [issues]);
 
+  const filtered = useMemo(() => {
+    if (!data) return data;
+    let result = data;
+    if (filter !== "all") {
+      result = result.filter((e) => e.entityType === filter);
+    }
+    if (actorFilter !== "all") {
+      result = result.filter((e) => e.actorType === actorFilter);
+    }
+    return result;
+  }, [data, filter, actorFilter]);
+
+  const entityTypes = data
+    ? [...new Set(data.map((e) => e.entityType))].sort()
+    : [];
+
+  const actorTypes = data
+    ? [...new Set(data.map((e) => e.actorType))].sort()
+    : [];
+
   if (!selectedCompanyId) {
     return <EmptyState icon={History} message="Select a company to view activity." />;
   }
@@ -102,18 +123,22 @@ export function Activity() {
     return <PageSkeleton variant="list" />;
   }
 
-  const filtered =
-    data && filter !== "all"
-      ? data.filter((e) => e.entityType === filter)
-      : data;
-
-  const entityTypes = data
-    ? [...new Set(data.map((e) => e.entityType))].sort()
-    : [];
-
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-end">
+      <div className="flex items-center justify-end gap-2">
+        <Select value={actorFilter} onValueChange={setActorFilter}>
+          <SelectTrigger className="w-[130px] h-8 text-xs">
+            <SelectValue placeholder="Filter by actor" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All actors</SelectItem>
+            {actorTypes.map((type) => (
+              <SelectItem key={type} value={type}>
+                {type === "user" ? "Humans" : type === "agent" ? "Agents" : "System"}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
         <Select value={filter} onValueChange={setFilter}>
           <SelectTrigger className="w-[140px] h-8 text-xs">
             <SelectValue placeholder="Filter by type" />

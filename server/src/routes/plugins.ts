@@ -1900,6 +1900,11 @@ export function pluginRoutes(
    * - 502 if the worker is unavailable or the RPC call fails
    */
   router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
+    // Slack url_verification challenge passthrough
+    if (req.body?.type === "url_verification" && req.body?.challenge) {
+      res.status(200).json({ challenge: req.body.challenge });
+      return;
+    }
     if (!webhookDeps) {
       res.status(501).json({ error: "Webhook ingestion is not enabled" });
       return;

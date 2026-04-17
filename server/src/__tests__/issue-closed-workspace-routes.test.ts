@@ -75,6 +75,16 @@ function registerServiceMocks() {
     }),
     issueApprovalService: () => ({}),
     issueService: () => mockIssueService,
+    knowledgeService: () => ({
+      crystallize: vi.fn(async () => ({ documentsCreated: 0, documentsReinforced: 0, issueIdentifier: null })),
+      getContextForTask: vi.fn(async () => []),
+      search: vi.fn(async () => []),
+      reinforce: vi.fn(async () => null),
+      upsertWikiDocument: vi.fn(async () => null),
+      listWikiDocuments: vi.fn(async () => []),
+      getWikiDocument: vi.fn(async () => null),
+      getStats: vi.fn(async () => ({ total: 0, byKind: {}, byTier: {}, details: [] })),
+    }),
     logActivity: mockLogActivity,
     projectService: () => mockProjectService,
     routineService: () => ({

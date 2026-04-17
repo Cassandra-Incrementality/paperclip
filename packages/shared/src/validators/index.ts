@@ -158,6 +158,10 @@ export {
   type IssueDocumentFormat,
   type UpsertIssueDocument,
   type RestoreIssueDocumentRevision,
+  fanOutChildSchema,
+  fanOutIssueSchema,
+  type FanOutChild,
+  type FanOutIssue,
 } from "./issue.js";
 
 export {

@@ -348,6 +348,13 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         const issue = issues.get(issueId);
         return isInCompany(issue, companyId) ? issue : null;
       },
+      async getByIdentifier(identifier) {
+        requireCapability(manifest, capabilitySet, "issues.read");
+        for (const issue of issues.values()) {
+          if (issue.identifier === identifier) return issue;
+        }
+        return null;
+      },
       async create(input) {
         requireCapability(manifest, capabilitySet, "issues.create");
         const now = new Date();

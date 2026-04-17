@@ -2109,6 +2109,74 @@ export function heartbeatService(db: Db) {
       .then((rows) => rows.length);
   }
 
+  /**
+   * Detect errors that indicate the session context is irrecoverably bloated
+   * and must be cleared to allow future runs to succeed.
+   */
+  function isSessionContextOverflowError(errorMessage: string | null | undefined): boolean {
+    if (!errorMessage) return false;
+    const patterns = [
+      "Prompt is too long",
+      "prompt is too long",
+      "context length exceeded",
+      "maximum context length",
+      "token limit exceeded",
+    ];
+    return patterns.some((p) => errorMessage.includes(p));
+  }
+
+  /**
+   * After a run fails due to a context-overflow error, enqueue a fresh-session
+   * wakeup so the agent resumes work immediately instead of being blocked
+   * until the next scheduled heartbeat. Carries the original issueId/taskKey
+   * and is guarded against infinite loops via the parent context marker.
+   */
+  async function enqueueOverflowRecoveryWakeup(input: {
+    agent: typeof agents.$inferSelect;
+    failedRunId: string;
+    parentContext: Record<string, unknown> | null | undefined;
+    issueId: string | null;
+    taskKey: string | null;
+  }): Promise<void> {
+    const { agent, failedRunId, parentContext, issueId, taskKey } = input;
+
+    if (parentContext && parentContext.autoRecoveryFrom === "context_overflow") {
+      logger.warn(
+        { agentId: agent.id, failedRunId, taskKey },
+        "context overflow recurred on a recovery retry — not re-enqueueing, manual review required",
+      );
+      return;
+    }
+
+    const recoveryContext: Record<string, unknown> = {
+      forceFreshSession: true,
+      autoRecoveryFrom: "context_overflow",
+      autoRecoveryFromRunId: failedRunId,
+    };
+    if (issueId) recoveryContext.issueId = issueId;
+    if (taskKey) recoveryContext.taskKey = taskKey;
+
+    try {
+      await enqueueWakeup(agent.id, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "context_overflow_auto_recovery",
+        contextSnapshot: recoveryContext,
+        idempotencyKey: `overflow-recovery:${failedRunId}`,
+        requestedByActorType: "system",
+      });
+      logger.info(
+        { agentId: agent.id, failedRunId, taskKey, issueId },
+        "enqueued fresh-session wakeup to recover from context overflow",
+      );
+    } catch (err) {
+      logger.warn(
+        { err, agentId: agent.id, failedRunId, taskKey },
+        "failed to enqueue context-overflow recovery wakeup — agent will resume on next scheduled heartbeat",
+      );
+    }
+  }
+
   async function ensureRuntimeState(agent: typeof agents.$inferSelect) {
     const existing = await getRuntimeState(agent.id);
     if (existing) return existing;
@@ -4079,11 +4147,28 @@ export function heartbeatService(db: Db) {
           legacySessionId: nextSessionState.legacySessionId,
         }, normalizedUsage);
         if (taskKey) {
-          if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
+          const shouldClearSession = adapterResult.clearSession
+            || (!nextSessionState.params && !nextSessionState.displayId)
+            || isSessionContextOverflowError(adapterResult.errorMessage);
+          if (shouldClearSession) {
+            const isOverflow = isSessionContextOverflowError(adapterResult.errorMessage);
+            if (isOverflow) {
+              logger.warn({ runId, taskKey, agentId: agent.id },
+                "clearing stale session due to context overflow error — next run will start fresh");
+            }
             await clearTaskSessions(agent.companyId, agent.id, {
               taskKey,
               adapterType: agent.adapterType,
             });
+            if (isOverflow) {
+              await enqueueOverflowRecoveryWakeup({
+                agent,
+                failedRunId: finalizedRun.id,
+                parentContext: context,
+                issueId: issueId ?? null,
+                taskKey,
+              });
+            }
           } else {
             await upsertTaskSession({
               companyId: agent.companyId,
@@ -4150,16 +4235,32 @@ export function heartbeatService(db: Db) {
         });
 
         if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
-          await upsertTaskSession({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            adapterType: agent.adapterType,
-            taskKey,
-            sessionParamsJson: previousSessionParams,
-            sessionDisplayId: previousSessionDisplayId,
-            lastRunId: failedRun.id,
-            lastError: message,
-          });
+          if (isSessionContextOverflowError(message)) {
+            logger.warn({ runId, taskKey, agentId: agent.id },
+              "clearing stale session due to context overflow error — next run will start fresh");
+            await clearTaskSessions(agent.companyId, agent.id, {
+              taskKey,
+              adapterType: agent.adapterType,
+            });
+            await enqueueOverflowRecoveryWakeup({
+              agent,
+              failedRunId: failedRun.id,
+              parentContext: context,
+              issueId: issueId ?? null,
+              taskKey,
+            });
+          } else {
+            await upsertTaskSession({
+              companyId: agent.companyId,
+              agentId: agent.id,
+              adapterType: agent.adapterType,
+              taskKey,
+              sessionParamsJson: previousSessionParams,
+              sessionDisplayId: previousSessionDisplayId,
+              lastRunId: failedRun.id,
+              lastError: message,
+            });
+          }
         }
       }
 

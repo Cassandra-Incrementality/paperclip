@@ -889,6 +889,7 @@ export interface PluginIssuesClient {
     offset?: number;
   }): Promise<Issue[]>;
   get(issueId: string, companyId: string): Promise<Issue | null>;
+  getByIdentifier(identifier: string): Promise<Issue | null>;
   create(input: {
     companyId: string;
     projectId?: string;

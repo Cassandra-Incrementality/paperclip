@@ -579,6 +579,10 @@ export interface WorkerToHostMethods {
     params: { issueId: string; companyId: string },
     result: Issue | null,
   ];
+  "issues.getByIdentifier": [
+    params: { identifier: string },
+    result: Issue | null,
+  ];
   "issues.create": [
     params: {
       companyId: string;

@@ -160,10 +160,11 @@ export interface HostServices {
     getWorkspaceForIssue(params: WorkerToHostMethods["projects.getWorkspaceForIssue"][0]): Promise<WorkerToHostMethods["projects.getWorkspaceForIssue"][1]>;
   };
 
-  /** Provides `issues.list`, `issues.get`, `issues.create`, `issues.update`, `issues.listComments`, `issues.createComment`. */
+  /** Provides `issues.list`, `issues.get`, `issues.getByIdentifier`, `issues.create`, `issues.update`, `issues.listComments`, `issues.createComment`. */
   issues: {
     list(params: WorkerToHostMethods["issues.list"][0]): Promise<WorkerToHostMethods["issues.list"][1]>;
     get(params: WorkerToHostMethods["issues.get"][0]): Promise<WorkerToHostMethods["issues.get"][1]>;
+    getByIdentifier(params: WorkerToHostMethods["issues.getByIdentifier"][0]): Promise<WorkerToHostMethods["issues.getByIdentifier"][1]>;
     create(params: WorkerToHostMethods["issues.create"][0]): Promise<WorkerToHostMethods["issues.create"][1]>;
     update(params: WorkerToHostMethods["issues.update"][0]): Promise<WorkerToHostMethods["issues.update"][1]>;
     listComments(params: WorkerToHostMethods["issues.listComments"][0]): Promise<WorkerToHostMethods["issues.listComments"][1]>;
@@ -309,6 +310,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   // Issues
   "issues.list": "issues.read",
   "issues.get": "issues.read",
+  "issues.getByIdentifier": "issues.read",
   "issues.create": "issues.create",
   "issues.update": "issues.update",
   "issues.listComments": "issue.comments.read",
@@ -496,6 +498,9 @@ export function createHostClientHandlers(
     }),
     "issues.get": gated("issues.get", async (params) => {
       return services.issues.get(params);
+    }),
+    "issues.getByIdentifier": gated("issues.getByIdentifier", async (params) => {
+      return services.issues.getByIdentifier(params);
     }),
     "issues.create": gated("issues.create", async (params) => {
       return services.issues.create(params);

@@ -22,7 +22,7 @@ export default defineConfig(({ mode }) => ({
       lexical: path.resolve(__dirname, "./node_modules/lexical/Lexical.mjs"),
     },
   },
-  server: {
+  server: { allowedHosts: ["paperclip.cassandragroup.cc", ".cassandragroup.cc"],
     port: 5173,
     watch: createUiDevWatchOptions(process.cwd()),
     proxy: {

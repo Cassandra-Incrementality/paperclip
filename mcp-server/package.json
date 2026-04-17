@@ -1,0 +1,14 @@
+{
+  "name": "@anthropic-ai/paperclip-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Paperclip — create and manage issues, agents, and heartbeats from Claude Code",
+  "type": "module",
+  "bin": {
+    "paperclip-mcp": "./index.js"
+  },
+  "keywords": ["mcp", "paperclip", "claude-code", "ai-agents", "issue-tracker"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}

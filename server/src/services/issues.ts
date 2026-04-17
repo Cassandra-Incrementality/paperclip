@@ -22,7 +22,7 @@ import {
   projectWorkspaces,
   projects,
 } from "@paperclipai/db";
-import type { IssueRelationIssueSummary } from "@paperclipai/shared";
+import type { FanOutIssue, IssueRelationIssueSummary } from "@paperclipai/shared";
 import { extractAgentMentionIds, extractProjectMentionIds, isUuidLike } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import {
@@ -2568,6 +2568,133 @@ export function issueService(db: Db) {
         project: a.projectId ? projectMap.get(a.projectId) ?? null : null,
         goal: a.goalId ? goalMap.get(a.goalId) ?? null : null,
       }));
+    },
+
+    fanOut: async (
+      parentId: string,
+      data: FanOutIssue,
+      actorInfo: { agentId: string | null; userId: string | null },
+    ) => {
+      // 1. Load parent and validate state
+      const parent = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, parentId))
+        .then((rows) => rows[0] ?? null);
+      if (!parent) throw notFound("Parent issue not found");
+      if (["done", "cancelled", "backlog"].includes(parent.status)) {
+        throw unprocessable(`Cannot fan out from a ${parent.status} issue`);
+      }
+
+      // 2. Validate all children assignees upfront (outside tx to fail fast)
+      for (const child of data.children) {
+        if (child.assigneeAgentId) {
+          await assertAssignableAgent(parent.companyId, child.assigneeAgentId);
+        }
+      }
+
+      const parentTargetStatus = data.parent?.status ?? "blocked";
+      const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
+
+      // 3. Single transaction: create all children + update parent
+      return db.transaction(async (tx: any) => {
+        const createdChildren: IssueWithLabels[] = [];
+
+        for (const childInput of data.children) {
+          // Self-correcting counter: use MAX(issue_number) + 1 if counter has drifted
+          const [maxRow] = await tx
+            .select({ maxNum: sql<number>`coalesce(max(${issues.issueNumber}), 0)` })
+            .from(issues)
+            .where(eq(issues.companyId, parent.companyId));
+          const currentMax = maxRow?.maxNum ?? 0;
+
+          const [company] = await tx
+            .update(companies)
+            .set({ issueCounter: sql`greatest(${companies.issueCounter}, ${currentMax}) + 1` })
+            .where(eq(companies.id, parent.companyId))
+            .returning({ issueCounter: companies.issueCounter, issuePrefix: companies.issuePrefix });
+
+          const issueNumber = company.issueCounter;
+          const identifier = `${company.issuePrefix}-${issueNumber}`;
+
+          // Resolve goalId from parent (matching create() logic)
+          const defaultGoal = parent.goalId ? null : await getDefaultCompanyGoal(tx, parent.companyId);
+          const resolvedGoalId = parent.goalId ?? defaultGoal?.id ?? null;
+
+          // Workspace inheritance from parent (matching create() logic at line 1414)
+          let executionWorkspaceId: string | null = null;
+          let executionWorkspacePreference: string | null = null;
+          let executionWorkspaceSettings: Record<string, unknown> | null = null;
+
+          if (isolatedWorkspacesEnabled && parent.executionWorkspaceId) {
+            const sourceWorkspace = await tx
+              .select({ id: executionWorkspaces.id, mode: executionWorkspaces.mode })
+              .from(executionWorkspaces)
+              .where(eq(executionWorkspaces.id, parent.executionWorkspaceId))
+              .then((rows: { id: string; mode: string }[]) => rows[0] ?? null);
+            if (sourceWorkspace) {
+              executionWorkspaceId = sourceWorkspace.id;
+              executionWorkspacePreference = "reuse_existing";
+              executionWorkspaceSettings = {
+                ...((parent.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? {}),
+                mode: issueExecutionWorkspaceModeForPersistedWorkspace(sourceWorkspace.mode),
+              };
+            }
+          }
+
+          const values = {
+            companyId: parent.companyId,
+            parentId: parent.id,
+            goalId: resolvedGoalId,
+            projectId: parent.projectId ?? null,
+            projectWorkspaceId: parent.projectWorkspaceId ?? null,
+            title: childInput.title,
+            description: childInput.description ?? null,
+            assigneeAgentId: childInput.assigneeAgentId ?? null,
+            priority: childInput.priority ?? parent.priority,
+            billingCode: childInput.billingCode ?? null,
+            status: "todo" as const,
+            originKind: "manual" as const,
+            issueNumber,
+            identifier,
+            createdByAgentId: actorInfo.agentId,
+            createdByUserId: actorInfo.userId,
+            requestDepth: 0,
+            ...(executionWorkspaceId ? { executionWorkspaceId } : {}),
+            ...(executionWorkspacePreference ? { executionWorkspacePreference } : {}),
+            ...(executionWorkspaceSettings ? { executionWorkspaceSettings } : {}),
+          } as typeof issues.$inferInsert;
+
+          const [inserted] = await tx.insert(issues).values(values).returning();
+          const [enriched] = await withIssueLabels(tx, [inserted]);
+          createdChildren.push(enriched);
+        }
+
+        // Update parent status within the same transaction
+        const parentPatch: Partial<typeof issues.$inferInsert> = { status: parentTargetStatus };
+        applyStatusSideEffects(parentTargetStatus, parentPatch);
+        parentPatch.updatedAt = new Date();
+
+        const [updatedParentRow] = await tx
+          .update(issues)
+          .set(parentPatch)
+          .where(eq(issues.id, parentId))
+          .returning();
+
+        // Append optional comment to parent
+        if (data.parent?.comment) {
+          await tx.insert(issueComments).values({
+            companyId: parent.companyId,
+            issueId: parentId,
+            authorAgentId: actorInfo.agentId,
+            authorUserId: actorInfo.userId,
+            body: data.parent.comment,
+          });
+        }
+
+        const [enrichedParent] = await withIssueLabels(tx, [updatedParentRow]);
+        return { parent: enrichedParent, children: createdChildren };
+      });
     },
   };
 }

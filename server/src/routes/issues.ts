@@ -11,6 +11,7 @@ import {
   createIssueLabelSchema,
   checkoutIssueSchema,
   createIssueSchema,
+  fanOutIssueSchema,
   feedbackTargetTypeSchema,
   feedbackTraceStatusSchema,
   feedbackVoteValueSchema,
@@ -2113,6 +2114,70 @@ export function issueRoutes(
     });
 
     res.json(released);
+  });
+
+  router.post("/issues/:id/fan-out", validate(fanOutIssueSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const parent = await svc.getById(id);
+    if (!parent) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, parent.companyId);
+
+    // Permission: agents must be the issue assignee or have tasks:assign permission
+    if (req.actor.type === "agent") {
+      const agentId = req.actor.agentId;
+      if (!agentId) {
+        res.status(403).json({ error: "Agent authentication required" });
+        return;
+      }
+      if (parent.assigneeAgentId !== agentId) {
+        const allowed = await access.hasPermission(parent.companyId, "agent", agentId, "tasks:assign");
+        if (!allowed) {
+          res.status(403).json({ error: "Only the issue assignee or a manager can fan out" });
+          return;
+        }
+      }
+    }
+
+    const actor = getActorInfo(req);
+    const result = await svc.fanOut(parent.id, req.body, {
+      agentId: actor.agentId ?? null,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+    });
+
+    // Log activity
+    await logActivity(db, {
+      companyId: parent.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.fan_out",
+      entityType: "issue",
+      entityId: parent.id,
+      details: {
+        childCount: result.children.length,
+        childIds: result.children.map((c) => c.id),
+        parentStatus: result.parent.status,
+      },
+    });
+
+    // Queue assignment wakeups for all assigned children
+    for (const child of result.children) {
+      void queueIssueAssignmentWakeup({
+        heartbeat,
+        issue: child,
+        reason: "issue_assigned",
+        mutation: "create",
+        contextSource: "issue.fan_out",
+        requestedByActorType: actor.actorType,
+        requestedByActorId: actor.actorId,
+      });
+    }
+
+    res.status(200).json({ ...result, runId: actor.runId ?? null });
   });
 
   router.get("/issues/:id/comments", async (req, res) => {

@@ -163,6 +163,28 @@ export const checkoutIssueSchema = z.object({
 
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;
 
+export const fanOutChildSchema = z.object({
+  title: z.string().min(1),
+  description: z.string().optional().nullable(),
+  assigneeAgentId: z.string().uuid().optional().nullable(),
+  priority: z.enum(ISSUE_PRIORITIES).optional(),
+  billingCode: z.string().optional().nullable(),
+});
+
+export const fanOutIssueSchema = z.object({
+  children: z.array(fanOutChildSchema).min(1).max(50),
+  parent: z
+    .object({
+      status: z.enum(["blocked", "in_progress"]).optional().default("blocked"),
+      comment: z.string().min(1).optional(),
+    })
+    .optional()
+    .default({}),
+});
+
+export type FanOutChild = z.infer<typeof fanOutChildSchema>;
+export type FanOutIssue = z.infer<typeof fanOutIssueSchema>;
+
 export const addIssueCommentSchema = z.object({
   body: z.string().min(1),
   reopen: z.boolean().optional(),

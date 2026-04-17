@@ -10,7 +10,7 @@ import { accessApi } from "../api/access";
 import { assetsApi } from "../api/assets";
 import { queryKeys } from "../lib/queryKeys";
 import { Button } from "@/components/ui/button";
-import { Settings, Check, Download, Upload } from "lucide-react";
+import { Settings, Check, Download, Upload, Copy, UserPlus, Clock } from "lucide-react";
 import { CompanyPatternIcon } from "../components/CompanyPatternIcon";
 import {
   Field,
@@ -56,6 +56,12 @@ export function CompanySettings() {
   const [inviteSnippet, setInviteSnippet] = useState<string | null>(null);
   const [snippetCopied, setSnippetCopied] = useState(false);
   const [snippetCopyDelightId, setSnippetCopyDelightId] = useState(0);
+
+  // Team invite state
+  const [teamInviteUrl, setTeamInviteUrl] = useState<string | null>(null);
+  const [teamInviteExpiry, setTeamInviteExpiry] = useState<string | null>(null);
+  const [teamInviteCopied, setTeamInviteCopied] = useState(false);
+  const [teamInviteError, setTeamInviteError] = useState<string | null>(null);
 
   const generalDirty =
     !!selectedCompany &&
@@ -156,6 +162,26 @@ export function CompanySettings() {
         err instanceof Error ? err.message : "Failed to create invite"
       );
     }
+  });
+
+  const teamInviteMutation = useMutation({
+    mutationFn: () =>
+      accessApi.createCompanyInvite(selectedCompanyId!, {
+        allowedJoinTypes: "human",
+      }),
+    onSuccess: (invite) => {
+      setTeamInviteError(null);
+      const base = window.location.origin.replace(/\/+$/, "");
+      const url = `${base}/invite/${invite.token}`;
+      setTeamInviteUrl(url);
+      setTeamInviteExpiry(invite.expiresAt);
+      setTeamInviteCopied(false);
+    },
+    onError: (err) => {
+      setTeamInviteError(
+        err instanceof Error ? err.message : "Failed to create invite"
+      );
+    },
   });
 
   const syncLogoState = (nextLogoUrl: string | null) => {
@@ -417,6 +443,78 @@ export function CompanySettings() {
         </div>
       </div>
 
+      {/* Team Members */}
+      <div className="space-y-4">
+        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+          Team Members
+        </div>
+        <div className="space-y-3 rounded-md border border-border px-4 py-4">
+          <div className="flex items-center gap-1.5">
+            <UserPlus className="h-3.5 w-3.5 text-muted-foreground" />
+            <span className="text-xs text-muted-foreground">
+              Generate an invite link to add team members to this company.
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              onClick={() => teamInviteMutation.mutate()}
+              disabled={teamInviteMutation.isPending}
+            >
+              {teamInviteMutation.isPending
+                ? "Generating..."
+                : "Generate Invite Link"}
+            </Button>
+          </div>
+          {teamInviteError && (
+            <p className="text-sm text-destructive">{teamInviteError}</p>
+          )}
+          {teamInviteUrl && (
+            <div className="rounded-md border border-border bg-muted/30 p-3 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Clock className="h-3 w-3" />
+                  Expires {teamInviteExpiry ? new Date(teamInviteExpiry).toLocaleString() : "soon"}
+                </div>
+                {teamInviteCopied && (
+                  <span className="flex items-center gap-1 text-xs text-green-600 animate-pulse">
+                    <Check className="h-3 w-3" />
+                    Copied
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  className="flex-1 rounded-md border border-border bg-background px-2 py-1.5 font-mono text-xs outline-none"
+                  value={teamInviteUrl}
+                  readOnly
+                  onClick={(e) => (e.target as HTMLInputElement).select()}
+                />
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(teamInviteUrl);
+                      setTeamInviteCopied(true);
+                      setTimeout(() => setTeamInviteCopied(false), 2000);
+                    } catch {
+                      /* clipboard may not be available */
+                    }
+                  }}
+                >
+                  <Copy className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Share this link with your team member. They will need to create an account to join.
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Invites */}
       <div className="space-y-4">
         <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
           Feedback Sharing

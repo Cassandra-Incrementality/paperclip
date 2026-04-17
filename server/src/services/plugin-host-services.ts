@@ -783,6 +783,10 @@ export function buildHostServices(
         const issue = await issues.getById(params.issueId);
         return (inCompany(issue, companyId) ? issue : null) as Issue | null;
       },
+      async getByIdentifier(params) {
+        const issue = await issues.getByIdentifier(params.identifier);
+        return (issue ?? null) as Issue | null;
+      },
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
