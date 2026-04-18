@@ -17,6 +17,7 @@ import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
 import { routineRoutes } from "./routes/routines.js";
 import { executionWorkspaceRoutes } from "./routes/execution-workspaces.js";
+import { entityRoutes } from "./routes/entities.js";
 import { goalRoutes } from "./routes/goals.js";
 import { approvalRoutes } from "./routes/approvals.js";
 import { secretRoutes } from "./routes/secrets.js";
@@ -184,6 +185,7 @@ export async function createApp(
   }));
   api.use(routineRoutes(db));
   api.use(executionWorkspaceRoutes(db));
+  api.use(entityRoutes(db));
   api.use(goalRoutes(db));
   api.use(approvalRoutes(db));
   api.use(secretRoutes(db));
