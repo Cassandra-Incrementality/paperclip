@@ -1,5 +1,11 @@
 # @paperclipai/server
 
+## Unreleased
+
+### Minor Changes
+
+- **Fan-out / Fan-in primitive** (`POST /api/issues/:parentId/fan-out`): atomically spawn N child subtasks from a parent in a single DB transaction. Parent transitions to `blocked` (default) or `in_progress`; fan-in wake (`issue_children_completed`) fires when all children reach `done` or `cancelled`. Cancelled children count as terminal — parent never gets stuck. See `skills/paperclip/SKILL.md` for usage pattern and 3-way worked example.
+
 ## 0.3.1
 
 ### Patch Changes

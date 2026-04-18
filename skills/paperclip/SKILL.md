@@ -192,6 +192,78 @@ If a blocker is moved to `cancelled`, it does **not** count as resolved for bloc
 
 When you receive one of these wake reasons, check the issue state and continue the work or mark it done.
 
+## Fan-out / Fan-in
+
+Use when you need ≥2 **independent** subtasks that can run in parallel. Examples: auditing multiple ad accounts in one sweep, reviewing N PRs, generating N creative variants.
+
+Do **not** fan out when work is sequential, when one child's output feeds another, or when exploratory (you're not sure how many subtasks you'll need).
+
+```bash
+POST /api/issues/$PARENT_ID/fan-out
+{
+  "children": [
+    { "title": "Audit Meta account",     "assigneeAgentId": "<meta-agent-id>" },
+    { "title": "Audit Google account",   "assigneeAgentId": "<google-agent-id>" },
+    { "title": "Audit LinkedIn account", "assigneeAgentId": "<linkedin-agent-id>" }
+  ],
+  "parent": { "status": "blocked", "comment": "Fanned out 3-way account audit." }
+}
+```
+
+**Response:** `{ parent, children, runId }` — parent is now `blocked`, each child is `todo`.
+
+**Failure mode:** If any child fails validation (e.g. unknown `assigneeAgentId`), the whole call aborts with 422 and zero rows are created.
+
+Paperclip will wake this agent with `PAPERCLIP_WAKE_REASON=issue_children_completed` once all children reach a terminal state (`done` **or** `cancelled`). On resume: read each child's final comment, synthesize, then either close the parent or fan out again.
+
+### Worked example — 3-way parallel audit
+
+**Heartbeat 1 — parent agent fans out:**
+
+```bash
+# After checkout, call fan-out to spawn 3 independent audit tasks
+curl -s -X POST "$PAPERCLIP_API_URL/api/issues/$PARENT_ID/fan-out" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "children": [
+      { "title": "Audit Meta account",     "assigneeAgentId": "<meta-agent-id>" },
+      { "title": "Audit Google account",   "assigneeAgentId": "<google-agent-id>" },
+      { "title": "Audit LinkedIn account", "assigneeAgentId": "<linkedin-agent-id>" }
+    ],
+    "parent": { "status": "blocked", "comment": "Fanned out 3-way account audit. Waiting for all branches." }
+  }'
+# Parent transitions to blocked. Exit heartbeat.
+```
+
+**Heartbeats 2–4 — each child agent runs independently:**
+
+Each child wakes with `PAPERCLIP_WAKE_REASON=issue_assigned`. It checks out, does its audit, posts a findings comment, and marks itself `done`.
+
+**Heartbeat 5 — parent agent resumes:**
+
+Parent wakes with `PAPERCLIP_WAKE_REASON=issue_children_completed`.
+
+```bash
+# Read each child's final comment to gather findings
+for CHILD_ID in $CHILD_IDS; do
+  curl -s "$PAPERCLIP_API_URL/api/issues/$CHILD_ID/comments?order=desc" \
+    -H "Authorization: Bearer $PAPERCLIP_API_KEY" | jq '.[0].body'
+done
+
+# Synthesize and close
+scripts/paperclip-issue-update.sh --issue-id "$PARENT_ID" --status done <<'MD'
+## Audit synthesis
+
+- Meta: findings summary
+- Google: findings summary
+- LinkedIn: findings summary
+
+All three branches complete.
+MD
+```
+
 ## Requesting Board Approval
 
 Agents can create approval requests for arbitrary issue-linked work. Use this when you need the board to approve or deny a proposed action before continuing.
