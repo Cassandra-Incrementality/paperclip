@@ -33,6 +33,7 @@ import { validate } from "../middleware/validate.js";
 import {
   accessService,
   agentService,
+  commentDigestService,
   executionWorkspaceService,
   feedbackService,
   goalService,
@@ -41,6 +42,7 @@ import {
   issueApprovalService,
   issueService,
   documentService,
+  knowledgeService,
   logActivity,
   projectService,
   routineService,
@@ -301,6 +303,7 @@ export function issueRoutes(
   const svc = issueService(db);
   const access = accessService(db);
   const heartbeat = heartbeatService(db);
+  const knowledge = knowledgeService(db);
   const feedback = feedbackService(db);
   const instanceSettings = instanceSettingsService(db);
   const agentsSvc = agentService(db);
@@ -311,6 +314,7 @@ export function issueRoutes(
   const workProductsSvc = workProductService(db);
   const documentsSvc = documentService(db);
   const routinesSvc = routineService(db);
+  const digestSvc = commentDigestService(db);
   const feedbackExportService = opts?.feedbackExportService;
   const upload = multer({
     storage: multer.memoryStorage(),
@@ -770,7 +774,7 @@ export function issueRoutes(
         ? req.query.wakeCommentId.trim()
         : null;
 
-    const [{ project, goal }, ancestors, commentCursor, wakeComment, relations, attachments] =
+    const [{ project, goal }, ancestors, commentCursor, wakeComment, relations, attachments, digestAvailable] =
       await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -778,6 +782,7 @@ export function issueRoutes(
       wakeCommentId ? svc.getComment(wakeCommentId) : null,
       svc.getRelationSummaries(issue.id),
       svc.listAttachments(issue.id),
+      digestSvc.isDigestAvailable(issue.id),
     ]);
 
     res.json({
@@ -822,6 +827,7 @@ export function issueRoutes(
           }
         : null,
       commentCursor,
+      digestAvailable,
       wakeComment:
         wakeComment && wakeComment.issueId === issue.id
           ? wakeComment
@@ -1903,6 +1909,26 @@ export function issueRoutes(
 
       const becameDone = existing.status !== "done" && issue.status === "done";
       if (becameDone) {
+        // Fire-and-forget wiki crystallization. Don't block the status update on LLM latency.
+        void knowledge
+          .crystallize(issue.companyId, issue.id)
+          .then(async (created) => {
+            if (created.length === 0) return;
+            await logActivity(db, {
+              companyId: issue.companyId,
+              actorType: "system",
+              actorId: "system",
+              agentId: null,
+              action: "knowledge.crystallized",
+              entityType: "issue",
+              entityId: issue.id,
+              details: { docsCreated: created.length, titles: created.map((d) => d.title) },
+            });
+          })
+          .catch((err) => {
+            logger.warn({ err, issueId: issue.id }, "wiki crystallize failed");
+          });
+
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
           addWakeup(dependent.assigneeAgentId, {
@@ -2212,6 +2238,40 @@ export function issueRoutes(
       limit,
     });
     res.json(comments);
+  });
+
+  router.get("/issues/:id/comments/digest", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    const verbatimLastRaw =
+      typeof req.query.verbatimLast === "string" ? Number(req.query.verbatimLast) : NaN;
+    const verbatimLast =
+      Number.isFinite(verbatimLastRaw) && verbatimLastRaw >= 0
+        ? Math.min(Math.floor(verbatimLastRaw), 50)
+        : 10;
+
+    let digestResult;
+    try {
+      digestResult = await digestSvc.getOrGenerate(id, issue.companyId, verbatimLast);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg === "nothing_to_digest") {
+        res.status(422).json({ error: "Not enough comments to digest" });
+        return;
+      }
+      throw err;
+    }
+
+    const verbatim = await svc.listComments(id, { order: "desc", limit: verbatimLast });
+    verbatim.reverse();
+
+    res.json({ ...digestResult, verbatim });
   });
 
   router.get("/issues/:id/comments/:commentId", async (req, res) => {

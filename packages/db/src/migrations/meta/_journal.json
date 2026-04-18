@@ -421,6 +421,13 @@
       "when": 1776699600001,
       "tag": "0059_issue_comment_digests",
       "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1776700000000,
+      "tag": "0060_wiki_knowledge_layer",
+      "breakpoints": true
     }
   ]
 }

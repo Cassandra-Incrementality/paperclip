@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, integer, timestamp, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, integer, real, timestamp, index, type AnyPgColumn } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 
@@ -18,9 +18,22 @@ export const documents = pgTable(
     updatedByUserId: text("updated_by_user_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+
+    // Wiki knowledge layer
+    kind: text("kind").notNull().default("manual"),
+    summary: text("summary"),
+    tags: text("tags").array(),
+    confidence: real("confidence").notNull().default(1.0),
+    sourceCount: integer("source_count").notNull().default(1),
+    decayTier: text("decay_tier").notNull().default("episodic"),
+    lastReinforcedAt: timestamp("last_reinforced_at", { withTimezone: true }),
+    supersededById: uuid("superseded_by_id").references((): AnyPgColumn => documents.id, { onDelete: "set null" }),
+    sourceIssueId: uuid("source_issue_id"),
   },
   (table) => ({
     companyUpdatedIdx: index("documents_company_updated_idx").on(table.companyId, table.updatedAt),
     companyCreatedIdx: index("documents_company_created_idx").on(table.companyId, table.createdAt),
+    companyKindIdx: index("documents_company_kind_idx").on(table.companyId, table.kind),
+    companyDecayTierIdx: index("documents_company_decay_tier_idx").on(table.companyId, table.decayTier),
   }),
 );

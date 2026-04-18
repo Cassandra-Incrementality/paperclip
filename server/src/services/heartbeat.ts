@@ -41,6 +41,7 @@ import {
   mergeHeartbeatRunResultJson,
 } from "./heartbeat-run-summary.js";
 import { logActivity, type LogActivityInput } from "./activity-log.js";
+import { knowledgeService } from "./knowledge.js";
 import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
@@ -1298,6 +1299,34 @@ async function buildPaperclipWakePayload(input: {
     });
   }
 
+  let wikiKnowledge: Array<{
+    id: string;
+    title: string | null;
+    summary: string | null;
+    kind: string;
+    tags: string[] | null;
+    similarity: number;
+  }> = [];
+  if (issueSummary?.title) {
+    try {
+      const knowledge = knowledgeService(input.db);
+      const hits = await knowledge.getContextForTask(input.companyId, issueSummary.title, [], 10);
+      wikiKnowledge = hits.map((h) => ({
+        id: h.id,
+        title: h.title,
+        summary: h.summary,
+        kind: h.kind,
+        tags: h.tags,
+        similarity: Number(h.similarity.toFixed(3)),
+      }));
+    } catch (err) {
+      logger.warn(
+        { err, companyId: input.companyId, issueId: issueSummary.id },
+        "wiki context lookup failed; continuing without wikiKnowledge",
+      );
+    }
+  }
+
   return {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
     issue: issueSummary
@@ -1319,6 +1348,7 @@ async function buildPaperclipWakePayload(input: {
       includedCount: comments.length,
       missingCount: missingCommentCount,
     },
+    wikiKnowledge,
     truncated,
     fallbackFetchNeeded: truncated || missingCommentCount > 0,
   };
