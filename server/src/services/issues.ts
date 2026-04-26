@@ -331,6 +331,7 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+const STALE_CHECKOUT_LOCK_TTL_MS = 10 * 60 * 1000;
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -3261,12 +3262,14 @@ export function issueService(db: Db) {
 
   async function isTerminalOrMissingHeartbeatRun(runId: string) {
     const run = await db
-      .select({ status: heartbeatRuns.status })
+      .select({ status: heartbeatRuns.status, updatedAt: heartbeatRuns.updatedAt })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
-    return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+    const lastUpdated = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+    return Date.now() - lastUpdated > STALE_CHECKOUT_LOCK_TTL_MS;
   }
 
   async function adoptStaleCheckoutRun(input: {
@@ -3348,7 +3351,7 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -3358,15 +3361,20 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
       );
       const run = await tx
-        .select({ status: heartbeatRuns.status })
+        .select({ status: heartbeatRuns.status, updatedAt: heartbeatRuns.updatedAt })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
+        const lastUpdated = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+        if (Date.now() - lastUpdated <= STALE_CHECKOUT_LOCK_TTL_MS) return false;
+      }
 
+      const clearCheckoutRunId = issue.checkoutRunId === issue.executionRunId;
       const updated = await tx
         .update(issues)
         .set({
+          ...(clearCheckoutRunId ? { checkoutRunId: null } : {}),
           executionRunId: null,
           executionAgentNameKey: null,
           executionLockedAt: null,
