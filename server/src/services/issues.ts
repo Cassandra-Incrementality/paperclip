@@ -778,6 +778,7 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+const STALE_CHECKOUT_LOCK_TTL_MS = 10 * 60 * 1000;
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -5197,8 +5198,23 @@ export function issueService(db: Db) {
     );
   }
 
+  // PPC-776: runs that die without writing a terminal status (kill -9, OOM)
+  // left checkoutRunId/executionRunId pinned forever, causing 409 on
+  // subsequent checkout attempts by the assigned agent. Deliberately NOT the
+  // shared heartbeatRunIsTerminalOrMissing() (used elsewhere for
+  // workspace-finalize settling, a different guard with its own semantics) --
+  // treat a non-terminal run whose row hasn't been touched in 10 min as dead
+  // for checkout-lock purposes specifically.
   async function isTerminalOrMissingHeartbeatRun(runId: string, dbOrTx: DbReader = db) {
-    return heartbeatRunIsTerminalOrMissing(dbOrTx, runId);
+    const run = await dbOrTx
+      .select({ status: heartbeatRuns.status, updatedAt: heartbeatRuns.updatedAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows: Array<{ status: string; updatedAt: Date }>) => rows[0] ?? null);
+    if (!run) return true;
+    if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+    const lastUpdated = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+    return Date.now() - lastUpdated > STALE_CHECKOUT_LOCK_TTL_MS;
   }
 
   // Mirrors the 10-minute inactivity TTL that already governs stale
@@ -5426,7 +5442,7 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -5436,15 +5452,20 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
       );
       const run = await tx
-        .select({ status: heartbeatRuns.status })
+        .select({ status: heartbeatRuns.status, updatedAt: heartbeatRuns.updatedAt })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
+        const lastUpdated = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+        if (Date.now() - lastUpdated <= STALE_CHECKOUT_LOCK_TTL_MS) return false;
+      }
 
+      const clearCheckoutRunId = issue.checkoutRunId === issue.executionRunId;
       const updated = await tx
         .update(issues)
         .set({
+          ...(clearCheckoutRunId ? { checkoutRunId: null } : {}),
           executionRunId: null,
           executionAgentNameKey: null,
           executionLockedAt: null,
@@ -5463,11 +5484,13 @@ export function issueService(db: Db) {
     });
   }
 
-  // Symmetric to clearExecutionRunIfTerminal. Clears checkoutRunId (and the
-  // bundled execution lock cols) when the row's checkoutRunId points at a
-  // heartbeat run that is terminal or no longer exists. No assignee/status
-  // precondition: a terminal run holds no real claim regardless of who is
-  // assigned or what status the issue is currently in.
+  // Symmetric to clearExecutionRunIfTerminal, TTL included (PPC-776): a run
+  // that dies without writing a terminal status (kill -9, OOM) must not hold
+  // checkoutRunId forever either. Clears checkoutRunId (and the bundled
+  // execution lock cols) when the row's checkoutRunId points at a heartbeat
+  // run that is terminal, TTL-stale, or no longer exists. No assignee/status
+  // precondition: a terminal/dead run holds no real claim regardless of who
+  // is assigned or what status the issue is currently in.
   async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
@@ -5484,22 +5507,28 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
       );
       const run = await tx
-        .select({ status: heartbeatRuns.status })
+        .select({ status: heartbeatRuns.status, updatedAt: heartbeatRuns.updatedAt })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.checkoutRunId))
         .then((rows) => rows[0] ?? null);
-      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
+        const lastUpdated = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
+        if (Date.now() - lastUpdated <= STALE_CHECKOUT_LOCK_TTL_MS) return false;
+      }
 
       if (issue.executionRunId && issue.executionRunId !== issue.checkoutRunId) {
         await tx.execute(
           sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
         );
         const executionRun = await tx
-          .select({ status: heartbeatRuns.status })
+          .select({ status: heartbeatRuns.status, updatedAt: heartbeatRuns.updatedAt })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, issue.executionRunId))
           .then((rows) => rows[0] ?? null);
-        if (executionRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)) return false;
+        if (executionRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)) {
+          const lastUpdated = executionRun.updatedAt ? new Date(executionRun.updatedAt).getTime() : 0;
+          if (Date.now() - lastUpdated <= STALE_CHECKOUT_LOCK_TTL_MS) return false;
+        }
       }
 
       const updated = await tx
