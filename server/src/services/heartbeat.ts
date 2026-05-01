@@ -8493,6 +8493,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
 
+        // Guard: Drop non-interaction deferred wakes for terminal-state issues.
+        // Comment wakes have their own reopen path (shouldReopenDeferredCommentWake above).
+        const deferredWakeReason =
+          readNonEmptyString(deferred.reason) ??
+          readNonEmptyString(deferredContextSeed.wakeReason) ??
+          "";
+        const isDeferredInteractionWake = ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS.has(deferredWakeReason);
+        if (!shouldReopenDeferredCommentWake && !isDeferredInteractionWake &&
+            (issue.status === "done" || issue.status === "cancelled")) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "failed",
+              finishedAt: new Date(),
+              error: "Deferred wake dropped: issue is in terminal state",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          logger.info(
+            { deferredWakeId: deferred.id, issueId: issue.id, issueStatus: issue.status, deferredAgentId: deferred.agentId },
+            "dropped deferred wake — issue is in terminal state",
+          );
+          continue;
+        }
+
+        // Guard: Drop deferred wakes where the target agent is not the issue's assignee,
+        // unless it's an interaction (comment/mention) or execution-policy wake (review/approval).
+        const isDeferredExemptFromAssigneeCheck =
+          isDeferredInteractionWake || deferredWakeReason.startsWith("execution_");
+        if (!isDeferredExemptFromAssigneeCheck &&
+            issue.assigneeAgentId && issue.assigneeAgentId !== deferred.agentId) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "failed",
+              finishedAt: new Date(),
+              error: "Deferred wake dropped: agent is not the issue assignee",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          logger.info(
+            { deferredWakeId: deferred.id, issueId: issue.id, assigneeAgentId: issue.assigneeAgentId, deferredAgentId: deferred.agentId },
+            "dropped deferred wake — agent is not the issue assignee",
+          );
+          continue;
+        }
+
         const promotedReason = readNonEmptyString(deferred.reason) ?? "issue_execution_promoted";
         const promotedSource =
           (readNonEmptyString(deferred.source) as WakeupOptions["source"]) ?? "automation";
@@ -8928,6 +8975,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             assigneeAgentId: issues.assigneeAgentId,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
+            assigneeAgentId: issues.assigneeAgentId,
+            status: issues.status,
           })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
@@ -8947,6 +8996,59 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
           });
+          return { kind: "skipped" as const };
+        }
+
+        // Guard: skip wakes for terminal-state issues (done/cancelled).
+        // Interaction wakes (comments, mentions, reopen-via-comment) are exempt because
+        // they carry their own reopen path in the deferred promotion loop.
+        const wakeReasonForGuard =
+          readNonEmptyString(enrichedContextSnapshot.wakeReason) ?? reason ?? "";
+        const isInteractionWakeForGuard = ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS.has(wakeReasonForGuard);
+        if (!isInteractionWakeForGuard && (issue.status === "done" || issue.status === "cancelled")) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "issue_terminal_state",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          logger.info(
+            { agentId, issueId, issueStatus: issue.status, wakeReason: wakeReasonForGuard },
+            "skipping issue wake — issue is in terminal state",
+          );
+          return { kind: "skipped" as const };
+        }
+
+        // Guard: skip wakes where the agent is not the issue's assignee.
+        // Interaction wakes (comment/mention) and execution-policy wakes (review/approval)
+        // are exempt because they legitimately target non-assignee agents.
+        const isAssigneeExemptWake =
+          isInteractionWakeForGuard || wakeReasonForGuard.startsWith("execution_");
+        if (!isAssigneeExemptWake && issue.assigneeAgentId && issue.assigneeAgentId !== agentId) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "issue_non_assignee_wake",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          logger.info(
+            { agentId, issueId, assigneeAgentId: issue.assigneeAgentId, wakeReason: wakeReasonForGuard },
+            "skipping issue wake — agent is not the issue assignee",
+          );
           return { kind: "skipped" as const };
         }
 
