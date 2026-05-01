@@ -20,12 +20,13 @@ import { timeAgo } from "../lib/timeAgo";
 import { Identity } from "./Identity";
 import { StatusIcon } from "./StatusIcon";
 
-export const issueTrailingColumns: InboxIssueColumn[] = ["assignee", "project", "workspace", "parent", "labels", "updated"];
+export const issueTrailingColumns: InboxIssueColumn[] = ["assignee", "creator", "project", "workspace", "parent", "labels", "updated"];
 
 const issueColumnLabels: Record<InboxIssueColumn, string> = {
   status: "Status",
   id: "ID",
   assignee: "Assignee",
+  creator: "Created by",
   project: "Project",
   workspace: "Workspace",
   parent: "Parent issue",
@@ -37,6 +38,7 @@ const issueColumnDescriptions: Record<InboxIssueColumn, string> = {
   status: "Issue state chip on the left edge.",
   id: "Ticket identifier like PAP-1009.",
   assignee: "Assigned agent or board user.",
+  creator: "User or agent who created the issue.",
   project: "Linked project pill with its color.",
   workspace: "Execution or project workspace used for the issue.",
   parent: "Parent issue identifier and title.",
@@ -52,6 +54,7 @@ function issueTrailingGridTemplate(columns: InboxIssueColumn[]): string {
   return columns
     .map((column) => {
       if (column === "assignee") return "minmax(6rem, 8rem)";
+      if (column === "creator") return "minmax(6rem, 8rem)";
       if (column === "project") return "minmax(4.5rem, 7rem)";
       if (column === "workspace") return "minmax(6rem, 9rem)";
       if (column === "parent") return "minmax(3.5rem, 5.5rem)";
@@ -210,6 +213,9 @@ export function InboxIssueTrailingColumns({
   parentTitle,
   assigneeContent,
   onFilterWorkspace,
+  creatorAgentName,
+  creatorUserName,
+  creatorUserAvatarUrl,
 }: {
   issue: Issue;
   columns: InboxIssueColumn[];
@@ -225,6 +231,9 @@ export function InboxIssueTrailingColumns({
   parentTitle: string | null;
   assigneeContent?: ReactNode;
   onFilterWorkspace?: (workspaceId: string) => void;
+  creatorAgentName?: string | null;
+  creatorUserName?: string | null;
+  creatorUserAvatarUrl?: string | null;
 }) {
   const activityText = timeAgo(issue.lastActivityAt ?? issue.lastExternalCommentAt ?? issue.updatedAt);
   const userLabel = assigneeUserName ?? formatAssigneeUserLabel(issue.assigneeUserId, currentUserId) ?? "User";
@@ -268,6 +277,40 @@ export function InboxIssueTrailingColumns({
           return (
             <span key={column} className="min-w-0 truncate text-xs text-muted-foreground">
               Unassigned
+            </span>
+          );
+        }
+
+        if (column === "creator") {
+          if (issue.createdByAgentId) {
+            return (
+              <span key={column} className="min-w-0 text-xs text-muted-foreground">
+                <Identity
+                  name={creatorAgentName ?? issue.createdByAgentId.slice(0, 8)}
+                  size="sm"
+                  className="min-w-0"
+                />
+              </span>
+            );
+          }
+
+          if (issue.createdByUserId) {
+            const label = creatorUserName ?? formatAssigneeUserLabel(issue.createdByUserId, currentUserId) ?? "User";
+            return (
+              <span key={column} className="min-w-0 text-xs text-muted-foreground">
+                <Identity
+                  name={label}
+                  avatarUrl={creatorUserAvatarUrl}
+                  size="sm"
+                  className="min-w-0"
+                />
+              </span>
+            );
+          }
+
+          return (
+            <span key={column} className="min-w-0 truncate text-xs text-muted-foreground">
+              System
             </span>
           );
         }

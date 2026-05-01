@@ -1661,6 +1661,14 @@ export function IssuesList({
                     currentUserId,
                     companyUserLabelMap,
                   ) ?? assigneeUserProfile?.label ?? null;
+                  const creatorUserProfile = issue.createdByUserId
+                    ? companyUserProfileMap.get(issue.createdByUserId) ?? null
+                    : null;
+                  const creatorUserLabel = formatAssigneeUserLabel(
+                    issue.createdByUserId,
+                    currentUserId,
+                    companyUserLabelMap,
+                  ) ?? creatorUserProfile?.label ?? null;
                   const toggleCollapse = (e: { preventDefault: () => void; stopPropagation: () => void }) => {
                     e.preventDefault();
                     e.stopPropagation();
@@ -1835,6 +1843,9 @@ export function IssuesList({
                               assigneeName={agentName(issue.assigneeAgentId)}
                               assigneeUserName={assigneeUserLabel}
                               assigneeUserAvatarUrl={assigneeUserProfile?.image ?? null}
+                              creatorAgentName={agentName(issue.createdByAgentId)}
+                              creatorUserName={creatorUserLabel}
+                              creatorUserAvatarUrl={creatorUserProfile?.image ?? null}
                               currentUserId={currentUserId}
                               parentIdentifier={parentIssue?.identifier ?? null}
                               parentTitle={parentIssue?.title ?? null}
