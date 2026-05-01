@@ -1934,6 +1934,28 @@ export async function runChildProcess(
       delete rawMerged[key];
     }
 
+    // Strip run-specific PAPERCLIP context vars that were NOT explicitly set by
+    // the adapter for this run. Without this, the Paperclip server process's own
+    // env (which may carry a stale PAPERCLIP_TASK_ID / PAPERCLIP_WAKE_REASON from
+    // the shell that spawned it) bleeds into every child process — causing agents
+    // to receive a previous run's task context even on unrelated timer wakes.
+    // Adapters that DO have a value for these vars always add them to opts.env,
+    // so presence in opts.env is the reliable signal that they're intentional.
+    const PAPERCLIP_RUN_CONTEXT_VARS = [
+      "PAPERCLIP_TASK_ID",
+      "PAPERCLIP_WAKE_REASON",
+      "PAPERCLIP_WAKE_COMMENT_ID",
+      "PAPERCLIP_APPROVAL_ID",
+      "PAPERCLIP_APPROVAL_STATUS",
+      "PAPERCLIP_LINKED_ISSUE_IDS",
+      "PAPERCLIP_WAKE_PAYLOAD_JSON",
+    ] as const;
+    for (const key of PAPERCLIP_RUN_CONTEXT_VARS) {
+      if (!(key in opts.env)) {
+        delete rawMerged[key];
+      }
+    }
+
     const mergedEnv = ensurePathInEnv(rawMerged);
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
