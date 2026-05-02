@@ -1,3 +1,6 @@
+import { promises as fsPromises } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -50,6 +53,9 @@ export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
+const CLAUDE_LOCAL_JSONL_TAIL_LINES = 3;
+const CLAUDE_LOCAL_JSONL_TAIL_LINE_PREVIEW = 200;
+const CLAUDE_LOCAL_JSONL_TOOL_USE_SCAN_LINES = 200;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
@@ -98,6 +104,55 @@ export type RunOutputSilenceSummary = {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+export type ClaudeLocalLivenessAssessment = {
+  sessionId: string | null;
+  transcriptPath: string | null;
+  transcriptMtime: Date | null;
+  /** ms since transcript mtime; null when no transcript was found. */
+  transcriptStaleMs: number | null;
+  /** Pretty-printed last few JSONL lines for review-issue evidence. */
+  transcriptTail: string;
+  lastToolUse: string | null;
+  /** `process.kill(pid, 0)` result; null when no pid is recorded. */
+  pidAlive: boolean | null;
+  hasInMemoryHandle: boolean;
+};
+
+function extractClaudeLocalToolUse(rawLine: string): string | null {
+  try {
+    const parsed = JSON.parse(rawLine) as Record<string, unknown>;
+    const message = parsed.message as Record<string, unknown> | undefined;
+    if (!message || !Array.isArray(message.content)) return null;
+    for (const part of message.content as Array<Record<string, unknown>>) {
+      if (part && part.type === "tool_use" && typeof part.name === "string") {
+        return part.name;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function formatClaudeLocalJsonlLine(rawLine: string): string {
+  try {
+    const parsed = JSON.parse(rawLine) as Record<string, unknown>;
+    const ts = typeof parsed.timestamp === "string" ? parsed.timestamp : "";
+    const type = typeof parsed.type === "string" ? parsed.type : "entry";
+    const message = parsed.message as Record<string, unknown> | undefined;
+    const content = message && Array.isArray(message.content)
+      ? (message.content as Array<Record<string, unknown>>)
+      : [];
+    const tools = content
+      .filter((c) => c && c.type === "tool_use" && typeof c.name === "string")
+      .map((c) => c.name as string);
+    if (tools.length > 0) return `${ts} tool_use: ${tools.join(", ")}`.trim();
+    return `${ts} ${type}`.trim();
+  } catch {
+    return rawLine.length > 200 ? `${rawLine.slice(0, 200)}…` : rawLine;
+  }
 }
 
 function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
@@ -295,7 +350,15 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export type RecoveryServiceDeps = {
+  enqueueWakeup: RecoveryWakeup;
+  /** Optional override for `~/.claude/projects` — primarily for tests. */
+  claudeLocalProjectsDir?: string;
+  /** Optional override for the `process.kill(pid, 0)` liveness probe — primarily for tests. */
+  pidIsAlive?: (pid: number) => boolean;
+};
+
+export function recoveryService(db: Db, deps: RecoveryServiceDeps) {
   const issuesSvc = issueService(db);
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
@@ -738,6 +801,112 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return null;
   }
 
+  function defaultClaudeLocalProjectsDir() {
+    return path.join(os.homedir(), ".claude", "projects");
+  }
+
+  function defaultPidIsAlive(pid: number) {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Liveness assessment for `claude_local` runs. Claude agents work primarily
+   * through tool calls (Bash, Read, Edit, MCP) and emit very little stdout —
+   * the authoritative activity signal is the per-session JSONL transcript at
+   * `~/.claude/projects/<projectKey>/<sessionId>.jsonl`. The watchdog uses
+   * this as a second liveness channel before raising a "silent active run"
+   * review issue (PPC-914).
+   */
+  async function assessClaudeLocalLiveness(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    runningAgent: typeof agents.$inferSelect;
+    now: Date;
+  }): Promise<ClaudeLocalLivenessAssessment | null> {
+    if (input.runningAgent.adapterType !== "claude_local") return null;
+
+    const sessionId = input.run.sessionIdAfter ?? input.run.sessionIdBefore ?? null;
+    const projectsDir = deps.claudeLocalProjectsDir ?? defaultClaudeLocalProjectsDir();
+    const pid = input.run.processPid;
+    const inMemory = runningProcesses.has(input.run.id);
+    const pidAlive: boolean | null =
+      typeof pid === "number" && Number.isFinite(pid)
+        ? (deps.pidIsAlive ?? defaultPidIsAlive)(pid)
+        : null;
+
+    if (!sessionId) {
+      return {
+        sessionId: null,
+        transcriptPath: null,
+        transcriptMtime: null,
+        transcriptStaleMs: null,
+        transcriptTail: "",
+        lastToolUse: null,
+        pidAlive,
+        hasInMemoryHandle: inMemory,
+      };
+    }
+
+    let projectDirs: string[] = [];
+    try {
+      projectDirs = await fsPromises.readdir(projectsDir);
+    } catch (err) {
+      logger.debug({ err, projectsDir }, "claude_local liveness: failed to list projects directory");
+    }
+
+    let transcriptPath: string | null = null;
+    let transcriptMtime: Date | null = null;
+    for (const dir of projectDirs) {
+      const candidate = path.join(projectsDir, dir, `${sessionId}.jsonl`);
+      try {
+        const stat = await fsPromises.stat(candidate);
+        if (stat.isFile() && (!transcriptMtime || stat.mtime > transcriptMtime)) {
+          transcriptMtime = stat.mtime;
+          transcriptPath = candidate;
+        }
+      } catch {
+        // missing file is the common case — skip silently.
+      }
+    }
+
+    let transcriptTail = "";
+    let lastToolUse: string | null = null;
+    if (transcriptPath) {
+      try {
+        const content = await fsPromises.readFile(transcriptPath, "utf8");
+        const lines = content.split("\n").filter((line) => line.trim().length > 0);
+        const tailLines = lines.slice(-CLAUDE_LOCAL_JSONL_TAIL_LINES);
+        transcriptTail = tailLines.map(formatClaudeLocalJsonlLine).join("\n");
+        const scanFrom = Math.max(0, lines.length - CLAUDE_LOCAL_JSONL_TOOL_USE_SCAN_LINES);
+        for (let i = lines.length - 1; i >= scanFrom; i -= 1) {
+          const toolName = extractClaudeLocalToolUse(lines[i]);
+          if (toolName) {
+            lastToolUse = toolName;
+            break;
+          }
+        }
+      } catch (err) {
+        logger.warn({ err, transcriptPath }, "claude_local liveness: failed to read JSONL transcript");
+      }
+    }
+
+    const transcriptStaleMs = transcriptMtime ? input.now.getTime() - transcriptMtime.getTime() : null;
+    return {
+      sessionId,
+      transcriptPath,
+      transcriptMtime,
+      transcriptStaleMs,
+      transcriptTail,
+      lastToolUse,
+      pidAlive,
+      hasInMemoryHandle: inMemory,
+    };
+  }
+
   async function collectStaleRunEvidence(input: {
     run: typeof heartbeatRuns.$inferSelect;
     runningAgent: typeof agents.$inferSelect;
@@ -806,6 +975,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     evidence: Awaited<ReturnType<typeof collectStaleRunEvidence>>;
     level: "suspicious" | "critical";
     now: Date;
+    claudeLocalLiveness?: ClaudeLocalLivenessAssessment | null;
   }) {
     const sourceIssue = input.sourceIssue
       ? issueUiLink({ identifier: input.sourceIssue.identifier, id: input.sourceIssue.id }, input.prefix)
@@ -825,7 +995,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         `- ${issueUiLink({ identifier: issue.identifier, id: issue.id }, input.prefix)} \`${issue.status}\`: ${issue.title}`,
       ).join("\n")
       : "- none detected";
-    return [
+    const liveness = input.claudeLocalLiveness ?? null;
+    const claudeLocalSection = liveness
+      ? [
+        "",
+        "## Claude Local Transcript",
+        "",
+        `- Session id: \`${liveness.sessionId ?? "unknown"}\``,
+        `- Transcript path: ${liveness.transcriptPath ? `\`${liveness.transcriptPath}\`` : "_not located_"}`,
+        `- Transcript mtime: ${liveness.transcriptMtime?.toISOString() ?? "n/a"}`,
+        `- Transcript stale for: ${liveness.transcriptStaleMs !== null ? formatDuration(liveness.transcriptStaleMs) : "n/a"}`,
+        `- Last tool_use: ${liveness.lastToolUse ?? "_none recorded in tail_"}`,
+        `- Process pid: \`${input.run.processPid ?? "unknown"}\` — alive: ${
+          liveness.pidAlive === null ? "unknown" : liveness.pidAlive ? "yes" : "no"
+        }`,
+        `- In-memory handle: ${liveness.hasInMemoryHandle ? "yes" : "no"}`,
+        "",
+        "Transcript tail (last entries):",
+        "",
+        liveness.transcriptTail
+          ? `\`\`\`text\n${liveness.transcriptTail}\n\`\`\``
+          : "_Transcript tail unavailable — this is a real silence signal._",
+      ].join("\n")
+      : "";
+
+    const sections: string[] = [
       `Paperclip detected ${input.level} output silence on an active heartbeat run.`,
       "",
       "## Run",
@@ -845,6 +1039,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       "## Last Output Excerpt",
       "",
       input.evidence.safeTail ? `\`\`\`text\n${input.evidence.safeTail}\n\`\`\`` : "_No run-log tail was available._",
+    ];
+    if (claudeLocalSection) sections.push(claudeLocalSection);
+    sections.push(
       "",
       "## Recent Run Events",
       "",
@@ -865,7 +1062,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       "- Preserve artifacts, branch state, and useful output before cancellation.",
       "- Cancel or recover through the explicit run recovery controls when authorized.",
       "- Close this issue as a false positive only after recording the reason.",
-    ].join("\n");
+    );
+    return sections.join("\n");
   }
 
   function isUniqueStaleRunEvaluationConflict(error: unknown) {
@@ -933,6 +1131,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     const runningAgent = await getAgent(input.run.agentId);
     if (!runningAgent || runningAgent.companyId !== input.run.companyId) return { kind: "skipped" as const };
+
+    // PPC-914: claude_local agents work primarily through tool calls, so stdout
+    // silence does not mean the run is silent. Consult the JSONL transcript and
+    // skip the watchdog when the agent has written to it within the suspicion
+    // window. A transcript that is itself stale still falls through to a real
+    // review issue.
+    const claudeLocalLiveness = await assessClaudeLocalLiveness({
+      run: input.run,
+      runningAgent,
+      now: input.now,
+    });
+    if (
+      claudeLocalLiveness &&
+      claudeLocalLiveness.transcriptStaleMs !== null &&
+      claudeLocalLiveness.transcriptStaleMs < ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS
+    ) {
+      return { kind: "transcript_alive" as const };
+    }
+
     const sourceIssue = await resolveStaleRunSourceIssue(input.run);
     const prefix = await getCompanyIssuePrefix(input.run.companyId);
     const evidence = await collectStaleRunEvidence({
@@ -982,6 +1199,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       evidence,
       level,
       now: input.now,
+      claudeLocalLiveness,
     });
     let evaluation: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
@@ -1079,6 +1297,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       escalated: 0,
       snoozed: 0,
       skipped: 0,
+      transcriptAlive: 0,
       evaluationIssueIds: [] as string[],
     };
 
@@ -1091,6 +1310,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (outcome.kind === "created") result.created += 1;
       else if (outcome.kind === "existing") result.existing += 1;
       else if (outcome.kind === "escalated") result.escalated += 1;
+      else if (outcome.kind === "transcript_alive") result.transcriptAlive += 1;
       else result.skipped += 1;
       if ("evaluationIssueId" in outcome && outcome.evaluationIssueId) {
         result.evaluationIssueIds.push(outcome.evaluationIssueId);
