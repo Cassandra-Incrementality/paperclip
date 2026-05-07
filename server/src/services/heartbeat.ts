@@ -8441,7 +8441,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           };
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
-        const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
+        const deferredWakeReason =
+          readNonEmptyString(deferred.reason) ??
+          readNonEmptyString(deferredContextSeed.wakeReason) ??
+          "";
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
         const shouldReopenDeferredCommentWake =
@@ -8495,10 +8498,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         // Guard: Drop non-interaction deferred wakes for terminal-state issues.
         // Comment wakes have their own reopen path (shouldReopenDeferredCommentWake above).
-        const deferredWakeReason =
-          readNonEmptyString(deferred.reason) ??
-          readNonEmptyString(deferredContextSeed.wakeReason) ??
-          "";
         const isDeferredInteractionWake = ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS.has(deferredWakeReason);
         if (!shouldReopenDeferredCommentWake && !isDeferredInteractionWake &&
             (issue.status === "done" || issue.status === "cancelled")) {
@@ -8975,8 +8974,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             assigneeAgentId: issues.assigneeAgentId,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
-            assigneeAgentId: issues.assigneeAgentId,
-            status: issues.status,
           })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
