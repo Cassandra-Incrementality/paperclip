@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractClaudeRetryNotBefore,
+  isClaudePromptTooLongError,
   isClaudeTransientUpstreamError,
 } from "./parse.js";
 
@@ -87,12 +88,71 @@ describe("isClaudeTransientUpstreamError", () => {
     ).toBe(false);
   });
 
+  it("does not classify 'Prompt is too long' as transient", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          is_error: true,
+          result: "Prompt is too long",
+          terminal_reason: "blocking_limit",
+        },
+      }),
+    ).toBe(false);
+  });
+
   it("does not classify deterministic validation errors as transient", () => {
     expect(
       isClaudeTransientUpstreamError({
         errorMessage: "Invalid request_error: Unknown parameter 'foo'.",
       }),
     ).toBe(false);
+  });
+});
+
+describe("isClaudePromptTooLongError", () => {
+  it("classifies a Claude CLI 'Prompt is too long' result as deterministic prompt-overflow", () => {
+    expect(
+      isClaudePromptTooLongError({
+        is_error: true,
+        result: "Prompt is too long",
+        stop_reason: "stop_sequence",
+        terminal_reason: "blocking_limit",
+      }),
+    ).toBe(true);
+  });
+
+  it("classifies the invalid_request error tag with 'Prompt is too long' content", () => {
+    expect(
+      isClaudePromptTooLongError({
+        is_error: true,
+        error: "invalid_request",
+        result: "Prompt is too long",
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false when the error text is unrelated", () => {
+    expect(
+      isClaudePromptTooLongError({
+        is_error: true,
+        result: "Maximum turns reached.",
+        terminal_reason: "max_turns",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false on non-error results that mention the phrase", () => {
+    expect(
+      isClaudePromptTooLongError({
+        is_error: false,
+        result: "Wrote a doc explaining 'Prompt is too long' errors.",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when input is null or empty", () => {
+    expect(isClaudePromptTooLongError(null)).toBe(false);
+    expect(isClaudePromptTooLongError({})).toBe(false);
   });
 });
 

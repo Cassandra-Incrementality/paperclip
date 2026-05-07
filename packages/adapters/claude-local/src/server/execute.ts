@@ -52,6 +52,7 @@ import {
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
   isClaudeMaxTurnsResult,
+  isClaudePromptTooLongError,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
 } from "./parse.js";
@@ -943,16 +944,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     const initial = await runAttempt(sessionId ?? null);
-    if (
-      sessionId &&
+    const promptTooLong =
+      sessionId != null &&
+      !initial.proc.timedOut &&
+      initial.parsed != null &&
+      isClaudePromptTooLongError(initial.parsed);
+    const unknownSession =
+      sessionId != null &&
       !initial.proc.timedOut &&
       (initial.proc.exitCode ?? 0) !== 0 &&
-      initial.parsed &&
-      isClaudeUnknownSessionError(initial.parsed)
-    ) {
+      initial.parsed != null &&
+      isClaudeUnknownSessionError(initial.parsed);
+    if (promptTooLong || unknownSession) {
+      const reason = promptTooLong
+        ? "exceeded the prompt window (Prompt is too long)"
+        : "is unavailable";
       await onLog(
         "stdout",
-        `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+        `[paperclip] Claude resume session "${sessionId}" ${reason}; retrying with a fresh session.\n`,
       );
       const retry = await runAttempt(null);
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });

@@ -1,5 +1,6 @@
 import type { UsageSummary } from "@paperclipai/adapter-utils";
 import {
+  asBoolean,
   asString,
   asNumber,
   parseObject,
@@ -196,6 +197,31 @@ export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): bo
   );
 }
 
+// "Prompt is too long" is returned by the Anthropic API when a resumed session's
+// cached context exceeds the model prompt window. It surfaces as `is_error: true`
+// with `error: "invalid_request"` and `terminal_reason: "blocking_limit"`. Resuming
+// the same session will fail identically forever, so it must be treated like
+// unknown-session: drop the cached sessionId and retry fresh.
+export function isClaudePromptTooLongError(parsed: Record<string, unknown> | null | undefined): boolean {
+  if (!parsed) return false;
+
+  const terminalReason = asString(parsed.terminal_reason, "").trim().toLowerCase();
+  const resultText = asString(parsed.result, "").trim();
+  const errorField = asString((parsed as Record<string, unknown>).error, "").trim().toLowerCase();
+  const allMessages = [resultText, ...extractClaudeErrorMessages(parsed)]
+    .map((msg) => msg.trim())
+    .filter(Boolean);
+
+  const hasPromptTooLong = allMessages.some((msg) => /prompt is too long/i.test(msg));
+  if (!hasPromptTooLong) return false;
+
+  // Be conservative: only fire when the API actually rejected the request.
+  // `is_error: true` plus either an invalid_request error tag or the
+  // blocking-limit terminal reason is what the Claude CLI emits for this case.
+  const isError = asBoolean(parsed.is_error, false);
+  return isError && (errorField === "invalid_request" || terminalReason === "blocking_limit" || allMessages.length > 0);
+}
+
 function buildClaudeTransientHaystack(input: {
   parsed?: Record<string, unknown> | null;
   stdout?: string | null;
@@ -375,7 +401,12 @@ export function isClaudeTransientUpstreamError(input: {
 }): boolean {
   const parsed = input.parsed ?? null;
   // Deterministic failures are handled by their own classifiers.
-  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed))) {
+  if (
+    parsed &&
+    (isClaudeMaxTurnsResult(parsed) ||
+      isClaudeUnknownSessionError(parsed) ||
+      isClaudePromptTooLongError(parsed))
+  ) {
     return false;
   }
   const loginMeta = detectClaudeLoginRequired({
