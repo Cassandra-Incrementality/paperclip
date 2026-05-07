@@ -507,9 +507,12 @@ function SubIssueProgressSummaryStrip({
   });
 
   const totalTokens = costSummary
-    ? costSummary.inputTokens + costSummary.cachedInputTokens + costSummary.outputTokens
+    ? (costSummary.inputTokens ?? 0) + (costSummary.cachedInputTokens ?? 0) + (costSummary.outputTokens ?? 0)
     : 0;
-  const showCostSummary = !!costSummary && (costSummary.runCount > 0 || totalTokens > 0);
+  const runCount = costSummary?.runCount ?? 0;
+  const issueCount = costSummary?.issueCount ?? 0;
+  const runtimeMs = costSummary?.runtimeMs ?? 0;
+  const showCostSummary = !!costSummary && (runCount > 0 || totalTokens > 0);
 
   return (
     <div className="border border-border bg-background p-3">
@@ -529,16 +532,16 @@ function SubIssueProgressSummaryStrip({
               <>
                 <span
                   className="text-muted-foreground tabular-nums"
-                  title={`${costSummary.runCount.toLocaleString()} run${
-                    costSummary.runCount === 1 ? "" : "s"
-                  } across ${costSummary.issueCount} sub-issue${
-                    costSummary.issueCount === 1 ? "" : "s"
+                  title={`${runCount.toLocaleString()} run${
+                    runCount === 1 ? "" : "s"
+                  } across ${issueCount} sub-issue${
+                    issueCount === 1 ? "" : "s"
                   }`}
                 >
                   {formatTokens(totalTokens)} tokens
                 </span>
                 <span className="text-muted-foreground tabular-nums">
-                  {formatDurationMs(costSummary.runtimeMs)} runtime
+                  {formatDurationMs(runtimeMs)} runtime
                 </span>
               </>
             )}
