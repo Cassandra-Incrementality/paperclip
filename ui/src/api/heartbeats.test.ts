@@ -27,4 +27,10 @@ describe("heartbeatsApi.liveRunsForCompany", () => {
 
     expect(mockApi.get).toHaveBeenCalledWith("/companies/company-1/live-runs?minCount=50&limit=50");
   });
+
+  it("defaults to minCount=0 (no padding with finished runs) when no options are passed", async () => {
+    await heartbeatsApi.liveRunsForCompany("company-1");
+
+    expect(mockApi.get).toHaveBeenCalledWith("/companies/company-1/live-runs?minCount=0");
+  });
 });

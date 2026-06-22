@@ -113,8 +113,10 @@ export const heartbeatsApi = {
     if (typeof options === "number") {
       searchParams.set("minCount", String(options));
     } else if (options) {
-      if (options.minCount) searchParams.set("minCount", String(options.minCount));
-      if (options.limit) searchParams.set("limit", String(options.limit));
+      if (options.minCount !== undefined) searchParams.set("minCount", String(options.minCount));
+      if (options.limit !== undefined) searchParams.set("limit", String(options.limit));
+    } else {
+      searchParams.set("minCount", "0");
     }
     const qs = searchParams.toString();
     return api.get<LiveRunForIssue[]>(`/companies/${companyId}/live-runs${qs ? `?${qs}` : ""}`);
