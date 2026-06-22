@@ -3,10 +3,15 @@ export { listClaudeSkills, syncClaudeSkills } from "./skills.js";
 export { listClaudeModels, refreshClaudeModels, resetClaudeModelsCacheForTests } from "./models.js";
 export { testEnvironment } from "./test.js";
 export {
+  claudeCommandSupportsEffortFlag,
+  resetClaudeCliCapabilitiesCacheForTests,
+} from "./cli-capabilities.js";
+export {
   parseClaudeStreamJson,
   describeClaudeFailure,
   isClaudeMaxTurnsResult,
   isClaudePromptTooLongError,
+  isClaudeRefusalResult,
   isClaudeUnknownSessionError,
 } from "./parse.js";
 export {
