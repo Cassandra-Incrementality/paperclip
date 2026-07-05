@@ -301,7 +301,11 @@ function runMetrics(run: HeartbeatRun) {
   };
 }
 
-type RunLogChunk = { ts: string; stream: "stdout" | "stderr" | "system"; chunk: string };
+export type RunLogChunk = {
+  ts: string;
+  stream: "stdout" | "stderr" | "system";
+  chunk: string;
+};
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -312,6 +316,22 @@ function asNonEmptyString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+export function buildHeartbeatProgressLogLine(
+  payload: Record<string, unknown>,
+  fallbackTimestamp: string,
+): RunLogChunk | null {
+  const message = asNonEmptyString(payload.message);
+  if (!message) return null;
+  const phase = asNonEmptyString(payload.phase);
+  const ts = asNonEmptyString(payload.updatedAt) ?? fallbackTimestamp;
+  const chunk = phase ? `[${phase}] ${message}` : message;
+  return { ts, stream: "system", chunk };
+}
+
+export function heartbeatProgressLogLineKey(line: RunLogChunk): string {
+  return `${line.ts}\u0000${line.stream}\u0000${line.chunk}`;
 }
 
 export function RunInvocationCard({
@@ -431,6 +451,8 @@ function workspaceOperationPhaseLabel(phase: WorkspaceOperation["phase"]) {
   switch (phase) {
     case "worktree_prepare":
       return "Worktree setup";
+    case "workspace_config_freshness":
+      return "Config freshness";
     case "workspace_provision":
       return "Provision";
     case "workspace_teardown":
@@ -1640,6 +1662,7 @@ function ConfigurationTab({
   }, [onSavingChange, isConfigSaving]);
 
   const canCreateAgents = Boolean(agent.permissions?.canCreateAgents);
+  const canCreateSkills = agent.permissions?.canCreateSkills !== false;
   const canAssignTasks = Boolean(agent.access?.canAssignTasks);
   const taskAssignSource = agent.access?.taskAssignSource ?? "none";
   const taskAssignLocked = agent.role === "ceo" || canCreateAgents;
@@ -1670,6 +1693,9 @@ function ConfigurationTab({
         hideInstructionsFile={hideInstructionsFile}
         sectionLayout="cards"
       />
+      <p className="text-xs text-muted-foreground">
+        Saved adapter config affects the next run. Active runs keep the config they started with, and config changes may start a fresh adapter session.
+      </p>
 
       <TrustPresetSection
         permissions={agent.permissions}
@@ -1687,6 +1713,7 @@ function ConfigurationTab({
         onChange={(nextPermissions) =>
           updatePermissions.mutate({
             canCreateAgents,
+            canCreateSkills,
             canAssignTasks,
             ...buildPermissionsForTrustPreset(nextPermissions, nextPermissions.trustPreset === "low_trust_review" ? "low_trust_review" : "standard"),
           })
@@ -1700,7 +1727,7 @@ function ConfigurationTab({
             <div className="space-y-1">
               <div>Can create new agents</div>
               <p className="text-xs text-muted-foreground">
-                Lets this agent create or hire agents and implicitly assign tasks.
+                Lets this agent create or hire agents. This also grants task assignment authority.
               </p>
             </div>
             <ToggleSwitch
@@ -1708,7 +1735,27 @@ function ConfigurationTab({
               onCheckedChange={() =>
                 updatePermissions.mutate({
                   canCreateAgents: !canCreateAgents,
+                  canCreateSkills,
                   canAssignTasks: !canCreateAgents ? true : canAssignTasks,
+                })
+              }
+              disabled={updatePermissions.isPending}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-4 text-sm">
+            <div className="space-y-1">
+              <div>Can create/import skills</div>
+              <p className="text-xs text-muted-foreground">
+                Lets this agent install, import, create, and scan company skills without creating agents.
+              </p>
+            </div>
+            <ToggleSwitch
+              checked={canCreateSkills}
+              onCheckedChange={() =>
+                updatePermissions.mutate({
+                  canCreateAgents,
+                  canCreateSkills: !canCreateSkills,
+                  canAssignTasks,
                 })
               }
               disabled={updatePermissions.isPending}
@@ -1726,6 +1773,7 @@ function ConfigurationTab({
               onCheckedChange={() =>
                 updatePermissions.mutate({
                   canCreateAgents,
+                  canCreateSkills,
                   canAssignTasks: !canAssignTasks,
                 })
               }
@@ -2091,6 +2139,9 @@ function PromptsTab({
           ))}
         </div>
       )}
+      <p className="text-xs text-muted-foreground">
+        Saved instructions affect the next run. Active runs keep the instructions they started with, and instruction changes may start a fresh adapter session.
+      </p>
 
       <Collapsible defaultOpen={currentMode === "external"}>
         <CollapsibleTrigger className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors group">
@@ -3560,6 +3611,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
   const [transcriptMode, setTranscriptMode] = useState<TranscriptMode>("nice");
   const logEndRef = useRef<HTMLDivElement>(null);
   const pendingLogLineRef = useRef("");
+  const seenProgressLogLineKeysRef = useRef<Set<string>>(new Set());
   const scrollContainerRef = useRef<ScrollContainer | null>(null);
   const isFollowingRef = useRef(false);
   const lastMetricsRef = useRef<{ scrollHeight: number; distanceFromBottom: number }>({
@@ -3707,6 +3759,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
   useEffect(() => {
     let cancelled = false;
     pendingLogLineRef.current = "";
+    seenProgressLogLineKeysRef.current = new Set();
     setLogLines([]);
     setLogOffset(0);
     setHasMoreLog(false);
@@ -3851,6 +3904,16 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
           const stream = streamRaw === "stderr" || streamRaw === "system" ? streamRaw : "stdout";
           const ts = asNonEmptyString((payload as Record<string, unknown>).ts) ?? event.createdAt;
           setLogLines((prev) => [...prev, { ts, stream, chunk }]);
+          return;
+        }
+
+        if (event.type === "heartbeat.run.progress") {
+          const line = buildHeartbeatProgressLogLine(payload, event.createdAt);
+          if (!line) return;
+          const key = heartbeatProgressLogLineKey(line);
+          if (seenProgressLogLineKeysRef.current.has(key)) return;
+          seenProgressLogLineKeysRef.current.add(key);
+          setLogLines((prev) => [...prev, line]);
           return;
         }
 
