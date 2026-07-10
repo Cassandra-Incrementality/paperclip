@@ -12982,6 +12982,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await markTimerHeartbeatChecked(agentId, source);
       return null;
     }
+    // Cost routing (Fase 0): a generic timer wake with no issue/comment/task attached is
+    // just "is there anything to do" triage, never a strategic decision. Force it onto the
+    // adapter's cheap model profile regardless of the agent's normally-assigned model, unless
+    // something upstream already requested a specific profile.
+    if (genericTimerWake && !readNonEmptyString(enrichedContextSnapshot.modelProfile)) {
+      enrichedContextSnapshot.modelProfile = "cheap";
+    }
 
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(agent.companyId, issueId);
