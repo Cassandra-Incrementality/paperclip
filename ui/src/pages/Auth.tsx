@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { AsciiArtAnimation } from "@/components/AsciiArtAnimation";
 import { Sparkles } from "lucide-react";
 
-type AuthMode = "sign_in" | "sign_up";
+type AuthMode = "sign_in" | "sign_up" | "forgot_password";
 
 export function AuthPage() {
   const queryClient = useQueryClient();
@@ -19,6 +19,7 @@ export function AuthPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [resetRequestSent, setResetRequestSent] = useState(false);
 
   const nextPath = useMemo(
     () => searchParams.get("next") || getRememberedInvitePath() || "/",
@@ -59,10 +60,32 @@ export function AuthPage() {
     },
   });
 
+  const resetRequestMutation = useMutation({
+    mutationFn: () =>
+      authApi.requestPasswordReset({
+        email: email.trim(),
+        redirectTo: `${window.location.origin}/reset-password`,
+      }),
+    onSuccess: () => {
+      setError(null);
+      setResetRequestSent(true);
+    },
+    onError: (err) => {
+      setError(err instanceof Error ? err.message : "Couldn't send the reset link");
+    },
+  });
+
   const canSubmit =
     email.trim().length > 0 &&
     password.trim().length > 0 &&
     (mode === "sign_in" || (name.trim().length > 0 && password.trim().length >= 8));
+  const canSubmitResetRequest = email.trim().length > 0;
+
+  function switchMode(next: AuthMode) {
+    setError(null);
+    setResetRequestSent(false);
+    setMode(next);
+  }
 
   if (isSessionLoading) {
     return (
@@ -83,95 +106,167 @@ export function AuthPage() {
           </div>
 
           <h1 className="text-xl font-semibold">
-            {mode === "sign_in" ? "Sign in to Paperclip" : "Create your Paperclip account"}
+            {mode === "sign_in" && "Sign in to Paperclip"}
+            {mode === "sign_up" && "Create your Paperclip account"}
+            {mode === "forgot_password" && "Reset your password"}
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            {mode === "sign_in"
-              ? "Use your email and password to access this instance."
-              : "Create an account for this instance. Email confirmation is not required in v1."}
+            {mode === "sign_in" && "Use your email and password to access this instance."}
+            {mode === "sign_up" && "Create an account for this instance. Email confirmation is not required in v1."}
+            {mode === "forgot_password" && "Enter your account email and we'll send you a link to reset your password."}
           </p>
 
-          <form
-            className="mt-6 space-y-4"
-            method="post"
-            action={mode === "sign_up" ? "/api/auth/sign-up/email" : "/api/auth/sign-in/email"}
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (mutation.isPending) return;
-              if (!canSubmit) {
-                setError("Please fill in all required fields.");
-                return;
-              }
-              mutation.mutate();
-            }}
-          >
-            {mode === "sign_up" && (
-              <div>
-                <label htmlFor="name" className="text-xs text-muted-foreground mb-1 block">Name</label>
-                <input
-                  id="name"
-                  name="name"
-                  className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  autoComplete="name"
-                  autoFocus
-                />
+          {mode === "forgot_password" ? (
+            resetRequestSent ? (
+              <div className="mt-6 space-y-4">
+                <p className="text-sm text-foreground">
+                  If <span className="font-medium">{email.trim()}</span> has an account, a reset link is on its way.
+                </p>
+                <button
+                  type="button"
+                  className="text-sm font-medium text-foreground underline underline-offset-2"
+                  onClick={() => switchMode("sign_in")}
+                >
+                  Back to sign in
+                </button>
               </div>
-            )}
-            <div>
-              <label htmlFor="email" className="text-xs text-muted-foreground mb-1 block">Email</label>
-              <input
-                id="email"
-                name="email"
-                className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                type="email"
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                autoComplete="email"
-                autoFocus={mode === "sign_in"}
-              />
-            </div>
-            <div>
-              <label htmlFor="password" className="text-xs text-muted-foreground mb-1 block">Password</label>
-              <input
-                id="password"
-                name="password"
-                className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-                type="password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                autoComplete={mode === "sign_in" ? "current-password" : "new-password"}
-              />
-            </div>
-            {error && <p className="text-xs text-destructive">{error}</p>}
-            <Button
-              type="submit"
-              disabled={mutation.isPending}
-              aria-disabled={!canSubmit || mutation.isPending}
-              className={`w-full ${!canSubmit && !mutation.isPending ? "opacity-50" : ""}`}
-            >
-              {mutation.isPending
-                ? "Working…"
-                : mode === "sign_in"
-                  ? "Sign In"
-                  : "Create Account"}
-            </Button>
-          </form>
-
-          <div className="mt-5 text-sm text-muted-foreground">
-            {mode === "sign_in" ? "Need an account?" : "Already have an account?"}{" "}
-            <button
-              type="button"
-              className="font-medium text-foreground underline underline-offset-2"
-              onClick={() => {
-                setError(null);
-                setMode(mode === "sign_in" ? "sign_up" : "sign_in");
+            ) : (
+              <form
+                className="mt-6 space-y-4"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  if (resetRequestMutation.isPending) return;
+                  if (!canSubmitResetRequest) {
+                    setError("Enter your email address.");
+                    return;
+                  }
+                  resetRequestMutation.mutate();
+                }}
+              >
+                <div>
+                  <label htmlFor="email" className="text-xs text-muted-foreground mb-1 block">Email</label>
+                  <input
+                    id="email"
+                    name="email"
+                    className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+                    type="email"
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    autoComplete="email"
+                    autoFocus
+                  />
+                </div>
+                {error && <p className="text-xs text-destructive">{error}</p>}
+                <Button
+                  type="submit"
+                  disabled={resetRequestMutation.isPending}
+                  aria-disabled={!canSubmitResetRequest || resetRequestMutation.isPending}
+                  className={`w-full ${!canSubmitResetRequest && !resetRequestMutation.isPending ? "opacity-50" : ""}`}
+                >
+                  {resetRequestMutation.isPending ? "Sending…" : "Send reset link"}
+                </Button>
+                <button
+                  type="button"
+                  className="text-sm font-medium text-foreground underline underline-offset-2"
+                  onClick={() => switchMode("sign_in")}
+                >
+                  Back to sign in
+                </button>
+              </form>
+            )
+          ) : (
+            <form
+              className="mt-6 space-y-4"
+              method="post"
+              action={mode === "sign_up" ? "/api/auth/sign-up/email" : "/api/auth/sign-in/email"}
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (mutation.isPending) return;
+                if (!canSubmit) {
+                  setError("Please fill in all required fields.");
+                  return;
+                }
+                mutation.mutate();
               }}
             >
-              {mode === "sign_in" ? "Create one" : "Sign in"}
-            </button>
-          </div>
+              {mode === "sign_up" && (
+                <div>
+                  <label htmlFor="name" className="text-xs text-muted-foreground mb-1 block">Name</label>
+                  <input
+                    id="name"
+                    name="name"
+                    className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                    autoComplete="name"
+                    autoFocus
+                  />
+                </div>
+              )}
+              <div>
+                <label htmlFor="email" className="text-xs text-muted-foreground mb-1 block">Email</label>
+                <input
+                  id="email"
+                  name="email"
+                  className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+                  type="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  autoComplete="email"
+                  autoFocus={mode === "sign_in"}
+                />
+              </div>
+              <div>
+                <div className="mb-1 flex items-center justify-between">
+                  <label htmlFor="password" className="text-xs text-muted-foreground">Password</label>
+                  {mode === "sign_in" && (
+                    <button
+                      type="button"
+                      className="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                      onClick={() => switchMode("forgot_password")}
+                    >
+                      Forgot password?
+                    </button>
+                  )}
+                </div>
+                <input
+                  id="password"
+                  name="password"
+                  className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  autoComplete={mode === "sign_in" ? "current-password" : "new-password"}
+                />
+              </div>
+              {error && <p className="text-xs text-destructive">{error}</p>}
+              <Button
+                type="submit"
+                disabled={mutation.isPending}
+                aria-disabled={!canSubmit || mutation.isPending}
+                className={`w-full ${!canSubmit && !mutation.isPending ? "opacity-50" : ""}`}
+              >
+                {mutation.isPending
+                  ? "Working…"
+                  : mode === "sign_in"
+                    ? "Sign In"
+                    : "Create Account"}
+              </Button>
+            </form>
+          )}
+
+          {mode !== "forgot_password" && (
+            <div className="mt-5 text-sm text-muted-foreground">
+              {mode === "sign_in" ? "Need an account?" : "Already have an account?"}{" "}
+              <button
+                type="button"
+                className="font-medium text-foreground underline underline-offset-2"
+                onClick={() => switchMode(mode === "sign_in" ? "sign_up" : "sign_in")}
+              >
+                {mode === "sign_in" ? "Create one" : "Sign in"}
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
