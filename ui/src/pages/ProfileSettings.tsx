@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Camera, LoaderCircle, Save, Trash2, UserRoundPen } from "lucide-react";
+import { Camera, KeyRound, LoaderCircle, Save, Trash2, UserRoundPen } from "lucide-react";
 import type { AuthSession, CurrentUserProfile, UpdateCurrentUserProfile } from "@paperclipai/shared";
 import { authApi } from "@/api/auth";
 import { assetsApi } from "@/api/assets";
@@ -27,6 +27,11 @@ export function ProfileSettings() {
   const [name, setName] = useState("");
   const [image, setImage] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [passwordError, setPasswordError] = useState<string | null>(null);
+  const [passwordChanged, setPasswordChanged] = useState(false);
   const sessionQuery = useQuery({
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
@@ -116,6 +121,23 @@ export function ProfileSettings() {
       setActionError(error instanceof Error ? error.message : "Failed to remove avatar.");
     },
   });
+
+  const changePasswordMutation = useMutation({
+    mutationFn: () => authApi.changePassword({ currentPassword, newPassword }),
+    onSuccess: () => {
+      setPasswordError(null);
+      setPasswordChanged(true);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+    },
+    onError: (error) => {
+      setPasswordChanged(false);
+      setPasswordError(error instanceof Error ? error.message : "Failed to change password.");
+    },
+  });
+  const canChangePassword =
+    currentPassword.length > 0 && newPassword.length >= 8 && newPassword === confirmPassword;
 
   if (sessionQuery.isLoading) {
     return <div className="text-sm text-muted-foreground">Loading profile...</div>;
@@ -267,6 +289,85 @@ export function ProfileSettings() {
             </Button>
           </div>
         </form>
+
+        <div className="space-y-4 border-t border-border/70 pt-8">
+          <div className="flex items-center gap-2">
+            <KeyRound className="h-5 w-5 text-muted-foreground" />
+            <h2 className="text-base font-semibold">Password</h2>
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Change the password you use to sign in to this instance.
+          </p>
+
+          {passwordError ? (
+            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+              {passwordError}
+            </div>
+          ) : null}
+          {passwordChanged ? (
+            <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-foreground">
+              Password changed.
+            </div>
+          ) : null}
+
+          <form
+            className="grid gap-6 md:grid-cols-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (changePasswordMutation.isPending) return;
+              if (!canChangePassword) {
+                setPasswordChanged(false);
+                setPasswordError(
+                  newPassword.length < 8
+                    ? "New password must be at least 8 characters."
+                    : newPassword !== confirmPassword
+                      ? "New passwords don't match."
+                      : "Enter your current password.",
+                );
+                return;
+              }
+              setPasswordError(null);
+              changePasswordMutation.mutate();
+            }}
+          >
+            <div className="space-y-2 md:col-span-2">
+              <Label htmlFor="current-password">Current password</Label>
+              <Input
+                id="current-password"
+                type="password"
+                value={currentPassword}
+                onChange={(event) => setCurrentPassword(event.target.value)}
+                autoComplete="current-password"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="new-password">New password</Label>
+              <Input
+                id="new-password"
+                type="password"
+                value={newPassword}
+                onChange={(event) => setNewPassword(event.target.value)}
+                autoComplete="new-password"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="confirm-new-password">Confirm new password</Label>
+              <Input
+                id="confirm-new-password"
+                type="password"
+                value={confirmPassword}
+                onChange={(event) => setConfirmPassword(event.target.value)}
+                autoComplete="new-password"
+              />
+            </div>
+            <div className="md:col-span-2 flex justify-end">
+              <Button type="submit" disabled={changePasswordMutation.isPending || !canChangePassword}>
+                {changePasswordMutation.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
+                {changePasswordMutation.isPending ? "Saving..." : "Change password"}
+              </Button>
+            </div>
+          </form>
+        </div>
       </section>
     </div>
   );

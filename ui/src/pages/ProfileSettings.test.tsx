@@ -12,6 +12,7 @@ const mockAuthApi = vi.hoisted(() => ({
   signUpEmail: vi.fn(),
   getProfile: vi.fn(),
   updateProfile: vi.fn(),
+  changePassword: vi.fn(),
   signOut: vi.fn(),
 }));
 
@@ -125,6 +126,63 @@ describe("ProfileSettings", () => {
       name: "Jane Example",
       image: "/api/assets/asset-1/content",
     });
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("changes the password via the already-live change-password endpoint", async () => {
+    mockAuthApi.changePassword.mockResolvedValue(undefined);
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ProfileSettings />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const currentPasswordInput = container.querySelector("#current-password") as HTMLInputElement | null;
+    const newPasswordInput = container.querySelector("#new-password") as HTMLInputElement | null;
+    const confirmPasswordInput = container.querySelector("#confirm-new-password") as HTMLInputElement | null;
+    expect(currentPasswordInput).not.toBeNull();
+    expect(newPasswordInput).not.toBeNull();
+    expect(confirmPasswordInput).not.toBeNull();
+
+    function setValue(input: HTMLInputElement, value: string) {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    await act(async () => {
+      setValue(currentPasswordInput as HTMLInputElement, "old-password-123");
+      setValue(newPasswordInput as HTMLInputElement, "new-password-456");
+      setValue(confirmPasswordInput as HTMLInputElement, "new-password-456");
+    });
+
+    const passwordForm = currentPasswordInput?.closest("form");
+    expect(passwordForm).not.toBeNull();
+
+    await act(async () => {
+      passwordForm?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(mockAuthApi.changePassword).toHaveBeenCalledWith({
+      currentPassword: "old-password-123",
+      newPassword: "new-password-456",
+    });
+    expect(container.textContent).toContain("Password changed.");
 
     await act(async () => {
       root.unmount();
