@@ -6774,6 +6774,46 @@ export function issueRoutes(
           });
         }
 
+        // in_review issues have assigneeAgentId = NULL (reviewer is a user); a user/non-assignee
+        // comment must still wake the agent that submitted the work for review.
+        const patchReturnAssignee = nextExecutionState?.returnAssignee ?? null;
+        const patchReturnAssigneeAgentId =
+          patchReturnAssignee?.type === "agent" ? (patchReturnAssignee.agentId ?? null) : null;
+        const patchCommenterAgentId = actorIsAgent ? actor.actorId : null;
+        if (
+          !assigneeId &&
+          !assigneeChanged &&
+          patchReturnAssigneeAgentId &&
+          patchReturnAssigneeAgentId !== patchCommenterAgentId &&
+          issue.status === "in_review" &&
+          !skipAssigneeCommentWake
+        ) {
+          addWakeup(patchReturnAssigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_commented",
+            payload: {
+              issueId: id,
+              commentId: comment.id,
+              mutation: "comment",
+              ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+              ...(interruptedRunId ? { interruptedRunId } : {}),
+            },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: id,
+              taskId: id,
+              commentId: comment.id,
+              wakeCommentId: comment.id,
+              source: "issue.comment",
+              wakeReason: "issue_commented",
+              ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+              ...(interruptedRunId ? { interruptedRunId } : {}),
+            },
+          });
+        }
+
         let mentionedIds: string[] = [];
         try {
           mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
@@ -8255,6 +8295,45 @@ export function issueRoutes(
             },
           });
         }
+      }
+
+      // in_review issues have assigneeAgentId = NULL (reviewer is a user); a user/non-assignee
+      // comment must still wake the agent that submitted the work for review.
+      const returnAssignee = currentExecutionState?.returnAssignee ?? null;
+      const returnAssigneeAgentId =
+        returnAssignee?.type === "agent" ? (returnAssignee.agentId ?? null) : null;
+      const commenterAgentId = actorIsAgent ? actor.actorId : null;
+      if (
+        !assigneeId &&
+        returnAssigneeAgentId &&
+        returnAssigneeAgentId !== commenterAgentId &&
+        currentIssue.status === "in_review" &&
+        !skipWake
+      ) {
+        addWakeup(returnAssigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_commented",
+          payload: {
+            issueId: currentIssue.id,
+            commentId: comment.id,
+            mutation: "comment",
+            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+            ...(interruptedRunId ? { interruptedRunId } : {}),
+          },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: currentIssue.id,
+            taskId: currentIssue.id,
+            commentId: comment.id,
+            wakeCommentId: comment.id,
+            source: "issue.comment",
+            wakeReason: "issue_commented",
+            ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+            ...(interruptedRunId ? { interruptedRunId } : {}),
+          },
+        });
       }
 
       let mentionedIds: string[] = [];

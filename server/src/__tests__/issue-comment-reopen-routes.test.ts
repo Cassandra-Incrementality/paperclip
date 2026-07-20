@@ -2152,6 +2152,169 @@ describe.sequential("issue comment reopen routes", () => {
     expect(issueCommentedWakeCalls).toEqual([]);
   });
 
+  // PPC-2880: in_review issues have assigneeAgentId = NULL (the reviewer is a user), so a
+  // user/mobile comment previously woke nobody. These assert the returnAssignee fallback wakes
+  // the agent that submitted the work for review, on both the POST /comments and PATCH comment
+  // paths, and that the existing auto-approval/self-comment guards still suppress it correctly.
+  it("wakes the returnAssignee via POST /comments when a user comments on an in_review issue (PPC-2880 fix)", async () => {
+    const returnAssigneeAgentId = "22222222-2222-4222-8222-222222222222";
+    const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
+    const issue = {
+      ...makeIssue("todo"),
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      executionState: {
+        status: "pending",
+        currentStageId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: returnAssigneeAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-mobile-1",
+      issueId: issue.id,
+      companyId: issue.companyId,
+      body: "Looks good, one tweak needed on the CTA copy.",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: null,
+      authorUserId: "local-board",
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Looks good, one tweak needed on the CTA copy." });
+
+    expect(res.status).toBe(201);
+    await waitForWakeup(() => {
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        returnAssigneeAgentId,
+        expect.objectContaining({
+          reason: "issue_commented",
+          payload: expect.objectContaining({
+            issueId: issue.id,
+            commentId: "comment-mobile-1",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("wakes the returnAssignee via PATCH comment when a user comments on an in_review issue (PPC-2880 parity)", async () => {
+    const returnAssigneeAgentId = "22222222-2222-4222-8222-222222222222";
+    // The reviewer participant must match the commenting actor (the default "local-board"
+    // board user) so applyIssueExecutionPolicyTransition — which the PATCH path always runs,
+    // unlike the POST /comments path's auto-approve-only gate — treats this as a no-op
+    // pass-through comment instead of drifted/stale stage state.
+    const policy = await normalizePolicy({
+      stages: [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          type: "review",
+          participants: [{ type: "user", userId: "local-board" }],
+        },
+      ],
+    })!;
+    const baseIssue = {
+      ...makeIssue("todo"),
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", userId: "local-board" },
+        returnAssignee: { type: "agent", agentId: returnAssigneeAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(baseIssue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-patch-1",
+      issueId: baseIssue.id,
+      companyId: baseIssue.companyId,
+      body: "checking in on this review",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: null,
+      authorUserId: "local-board",
+    });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...baseIssue,
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "checking in on this review" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() => {
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        returnAssigneeAgentId,
+        expect.objectContaining({
+          reason: "issue_commented",
+          payload: expect.objectContaining({
+            issueId: baseIssue.id,
+            commentId: "comment-patch-1",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("does not wake the returnAssignee when it comments on its own in_review issue (self-comment guard)", async () => {
+    const returnAssigneeAgentId = "22222222-2222-4222-8222-222222222222";
+    const issue = {
+      ...makeIssue("todo"),
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      executionState: {
+        status: "pending",
+        currentStageId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", userId: "local-board" },
+        returnAssignee: { type: "agent", agentId: returnAssigneeAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-self-1",
+      issueId: issue.id,
+      companyId: issue.companyId,
+      body: "still working on final polish",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: returnAssigneeAgentId,
+      authorUserId: null,
+    });
+
+    const res = await request(await installActor(createApp(), agentActor(returnAssigneeAgentId)))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "still working on final polish" });
+
+    expect(res.status).toBe(201);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it("does not auto-approve APPROVED comments from a non-review participant", async () => {
     const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
     const policy = await normalizePolicy({
