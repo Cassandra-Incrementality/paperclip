@@ -59,6 +59,37 @@ describe.sequential("auth routes", () => {
     image: "https://example.com/jane.png",
   };
 
+  it("returns a null session (200) instead of 401 for a non-board actor", async () => {
+    const app = await createApp(
+      {
+        type: "none",
+        source: "none",
+      },
+      baseUser,
+    );
+
+    const res = await request(app).get("/api/auth/get-session");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ session: null, user: null });
+  });
+
+  it("returns a null session (200) for an agent actor with no board userId", async () => {
+    const app = await createApp(
+      {
+        type: "agent",
+        agentId: "agent-1",
+        source: "agent_key",
+      },
+      baseUser,
+    );
+
+    const res = await request(app).get("/api/auth/get-session");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ session: null, user: null });
+  });
+
   it("returns the persisted user profile in the session payload", async () => {
     const app = await createApp(
       {

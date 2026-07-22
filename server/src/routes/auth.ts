@@ -39,7 +39,12 @@ export function authRoutes(db: Db) {
 
   router.get("/get-session", async (req, res) => {
     if (req.actor.type !== "board" || !req.actor.userId) {
-      throw unauthorized("Board authentication required");
+      // better-auth's own contract: anonymous is a valid 200 with a null session,
+      // not a 401. Non-board callers (agent/run tokens) hit this route too, and a
+      // thrown 401 here made every anonymous session-read look like an outage
+      // instead of "not signed in" (PPC-2973).
+      res.json({ session: null, user: null });
+      return;
     }
 
     const user = await loadCurrentUserProfile(db, req.actor.userId);
