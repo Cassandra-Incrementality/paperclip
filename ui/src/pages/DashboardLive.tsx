@@ -6,8 +6,7 @@ import { EmptyState } from "../components/EmptyState";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 
-const ACTIVE_LIMIT = 50;
-const RECENT_LIMIT = 12;
+const DASHBOARD_LIVE_RUN_LIMIT = 50;
 
 export function DashboardLive() {
   const { selectedCompanyId, companies } = useCompany();
@@ -30,50 +29,36 @@ export function DashboardLive() {
   }
 
   return (
-    <div className="space-y-8">
-      <div>
-        <Link
-          to="/dashboard"
-          className="inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
-        >
-          <ArrowLeft className="h-3.5 w-3.5" />
-          Dashboard
-        </Link>
-        <h1 className="mt-2 text-2xl font-semibold tracking-normal text-foreground">Live agent runs</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Currently running agents at the top, recent completed runs below.
-        </p>
+    <div className="space-y-5">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <Link
+            to="/dashboard"
+            className="inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <ArrowLeft className="h-3.5 w-3.5" />
+            Dashboard
+          </Link>
+          <h1 className="mt-2 text-2xl font-semibold tracking-normal text-foreground">Live agent runs</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Active runs first, followed by the most recent completed runs.
+          </p>
+        </div>
+        <div className="text-sm text-muted-foreground">Showing up to {DASHBOARD_LIVE_RUN_LIMIT}</div>
       </div>
 
       <ActiveAgentsPanel
         companyId={selectedCompanyId}
-        title="Live now"
-        filterStatuses="active"
-        minRunCount={0}
-        fetchLimit={ACTIVE_LIMIT}
-        cardLimit={ACTIVE_LIMIT}
+        title="Active / recent"
+        minRunCount={DASHBOARD_LIVE_RUN_LIMIT}
+        fetchLimit={DASHBOARD_LIVE_RUN_LIMIT}
+        cardLimit={DASHBOARD_LIVE_RUN_LIMIT}
         gridClassName="gap-3 md:grid-cols-2 2xl:grid-cols-3"
-        cardClassName="h-[420px]"
-        emptyMessage="No agents are running right now."
-        queryScope="dashboard-live-active"
+        cardClassName="h-(--sz-420px)"
+        emptyMessage="No active or recent agent runs."
+        queryScope="dashboard-live"
         showMoreLink={false}
       />
-
-      <div className="border-t border-border/60 pt-6">
-        <ActiveAgentsPanel
-          companyId={selectedCompanyId}
-          title={`Recent runs (last ${RECENT_LIMIT})`}
-          filterStatuses="finished"
-          minRunCount={RECENT_LIMIT * 2}
-          fetchLimit={RECENT_LIMIT * 2}
-          cardLimit={RECENT_LIMIT}
-          gridClassName="gap-3 md:grid-cols-2 2xl:grid-cols-3"
-          cardClassName="h-[420px]"
-          emptyMessage="No recent runs."
-          queryScope="dashboard-live-recent"
-          showMoreLink={false}
-        />
-      </div>
     </div>
   );
 }
