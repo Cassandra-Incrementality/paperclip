@@ -75,7 +75,14 @@ export const AGENT_ROLE_LABELS: Record<AgentRole, string> = {
   general: "General",
 };
 
-export const AGENT_DEFAULT_MAX_CONCURRENT_RUNS = 20;
+// Lowered from 20 on 2026-07-10 (PPC-2416..2422 incident): a burst of same-agent
+// assignment wakeups previously ran fully concurrently, up to 20-wide, each paying a
+// full fresh-context load — 7 landed on CTO within 4 seconds and ran 10-25min each in
+// parallel, two of which failed with claude_transient_upstream after burning the full
+// context cost. The queue/dispatch gate (startNextQueuedRunForAgent) already throttles
+// correctly at low caps (see heartbeat-dependency-scheduling.test.ts); this just tightens
+// the default so it actually engages under a normal-sized burst instead of at 20-wide.
+export const AGENT_DEFAULT_MAX_CONCURRENT_RUNS = 3;
 export const WORKSPACE_BRANCH_ROUTINE_VARIABLE = "workspaceBranch";
 
 export const MODEL_PROFILE_KEYS = ["cheap"] as const;
