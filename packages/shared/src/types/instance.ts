@@ -42,6 +42,11 @@ export interface InstanceGeneralSettings {
    * Kubernetes sandbox provider and denies local/ssh execution.
    */
   executionMode?: InstanceExecutionMode;
+  /**
+   * Rejects (409) an agent comment when a still-live sibling run of the same
+   * agent already wrote to the same issue thread. Defaults on.
+   */
+  guardSameAgentConcurrentThreadWrites: boolean;
 }
 
 export interface InstanceExperimentalSettings {

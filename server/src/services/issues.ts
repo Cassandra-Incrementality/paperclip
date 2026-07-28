@@ -4514,6 +4514,56 @@ export function issueService(db: Db) {
     return Date.now() - lastUpdated > STALE_CHECKOUT_LOCK_TTL_MS;
   }
 
+  /**
+   * PPC-3187: finds a comment a *different, still-live* run of the same agent
+   * already wrote to this issue thread. Guards the issue a run *writes to* —
+   * `issues.executionRunId` only guards the issue a run *executes on*, so two
+   * sibling runs of one agent can otherwise both write authoritative rulings
+   * into a third issue's thread (PPC-3160). Deleted/tombstoned comments don't
+   * count — there is nothing left to reconcile against. Most-recent live
+   * conflict wins when more than one sibling run has written here.
+   */
+  async function findLiveSameAgentThreadConflict(
+    targetIssueId: string,
+    agentId: string,
+    excludeRunId: string,
+    dbOrTx: DbReader = db,
+  ): Promise<{ commentId: string; runId: string; body: string; createdAt: Date } | null> {
+    const candidates = await dbOrTx
+      .select({
+        id: issueComments.id,
+        body: issueComments.body,
+        createdAt: issueComments.createdAt,
+        createdByRunId: issueComments.createdByRunId,
+      })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, targetIssueId),
+          eq(issueComments.authorAgentId, agentId),
+          isNull(issueComments.deletedAt),
+          // SQL `<>` against NULL yields NULL (excluded by WHERE), so this also
+          // drops comments with no run id.
+          ne(issueComments.createdByRunId, excludeRunId),
+        ),
+      )
+      .orderBy(desc(issueComments.createdAt));
+
+    for (const candidate of candidates) {
+      if (!candidate.createdByRunId) continue;
+      const siblingIsDeadOrStale = await isTerminalOrMissingHeartbeatRun(candidate.createdByRunId, dbOrTx);
+      if (!siblingIsDeadOrStale) {
+        return {
+          commentId: candidate.id,
+          runId: candidate.createdByRunId,
+          body: candidate.body,
+          createdAt: candidate.createdAt,
+        };
+      }
+    }
+    return null;
+  }
+
   async function adoptStaleCheckoutRun(input: {
     issueId: string;
     actorAgentId: string;
@@ -7595,6 +7645,28 @@ export function issueService(db: Db) {
           { issueId, companyId: issue.companyId, runId: actor.runId },
           "dropping invalid createdByRunId for issue comment insert",
         );
+      }
+      if (actor.agentId && createdByRunId) {
+        const guardEnabled = (await instanceSettings.getGeneral()).guardSameAgentConcurrentThreadWrites;
+        if (guardEnabled) {
+          const conflictingComment = await findLiveSameAgentThreadConflict(
+            issueId,
+            actor.agentId,
+            createdByRunId,
+            dbOrTx,
+          );
+          if (conflictingComment) {
+            throw conflict("Concurrent same-agent write to this thread", {
+              issueId,
+              conflictingRunId: conflictingComment.runId,
+              conflictingCommentId: conflictingComment.commentId,
+              conflictingCommentBody: conflictingComment.body,
+              conflictingCreatedAt: conflictingComment.createdAt,
+              guidance:
+                "Another live run of yours already wrote to this thread. Re-read it, reconcile both positions, and post ONE merged comment.",
+            });
+          }
+        }
       }
       const [comment] = await dbOrTx
         .insert(issueComments)

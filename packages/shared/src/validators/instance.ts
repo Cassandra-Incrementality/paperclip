@@ -34,6 +34,10 @@ export const instanceGeneralSettingsSchema = z.object({
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
+  // Rejects (409) an agent comment when a still-live sibling run of the same
+  // agent already wrote to the same issue thread. Defaults on; kill switch for
+  // PPC-3187 in case the predicate misbehaves in production.
+  guardSameAgentConcurrentThreadWrites: z.boolean().default(true),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = instanceGeneralSettingsSchema.partial();
