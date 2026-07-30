@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   agentRuntimeState,
@@ -18,6 +18,7 @@ import {
   issues,
   projects,
 } from "@paperclipai/db";
+import { parseProviderQuotaResetTime } from "@paperclipai/adapter-utils";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -31,10 +32,15 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
 } from "../services/heartbeat.ts";
+import { recoveryService } from "../services/recovery/service.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const PROVIDER_QUOTA_TEST_ADAPTER = "provider_quota_test";
+const ACPX_QUOTA_TEST_ADAPTER = "acpx_quota_test";
+// PPC-3228 fleet-stall thread: verbatim ACPX weekly-limit message.
+const ACPX_VERBATIM_QUOTA_MESSAGE =
+  "Internal error: You've hit your weekly limit · resets Jul 30 at 12pm (Europe/Rome).";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -88,6 +94,33 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         testedAt: new Date().toISOString(),
       }),
     });
+    // PPC-3260: mirrors the exact shape the real ACPX terminal-failure path
+    // (packages/adapter-utils/src/acpx-engine/execute.ts) now returns --
+    // errorCode stays the adapter-specific "acpx_turn_failed", classification
+    // rides in errorFamily/retryNotBefore instead of the errorCode.
+    registerServerAdapter({
+      type: ACPX_QUOTA_TEST_ADAPTER,
+      execute: async () => {
+        const now = new Date("2026-07-29T08:00:00.000Z");
+        const retryNotBefore = parseProviderQuotaResetTime(ACPX_VERBATIM_QUOTA_MESSAGE, now)!.toISOString();
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: ACPX_VERBATIM_QUOTA_MESSAGE,
+          errorCode: "acpx_turn_failed",
+          errorFamily: "provider_quota",
+          retryNotBefore,
+          resultJson: { status: "failed", stopReason: ACPX_VERBATIM_QUOTA_MESSAGE },
+        };
+      },
+      testEnvironment: async () => ({
+        adapterType: ACPX_QUOTA_TEST_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
   }, 20_000);
 
   afterEach(async () => {
@@ -96,6 +129,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
   afterAll(async () => {
     unregisterServerAdapter(PROVIDER_QUOTA_TEST_ADAPTER);
+    unregisterServerAdapter(ACPX_QUOTA_TEST_ADAPTER);
     await tempDb?.cleanup();
   });
 
@@ -285,6 +319,141 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         { timeout: 5_000, interval: 50 },
       )
       .toEqual({ status: "idle", errorReason: null });
+  });
+
+  // PPC-3260 acceptance criterion 3: an ACPX terminal failure (errorCode
+  // "acpx_turn_failed", never "provider_quota" itself) must still leave the
+  // agent idle via errorFamily, and the recovery backstop must still be able
+  // to schedule the reset-time monitor from that same adapter-specific code.
+  it("leaves the agent idle (not errored) on an ACPX terminal failure classified as provider_quota", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ACPX Quota Test",
+      role: "engineer",
+      status: "idle",
+      adapterType: ACPX_QUOTA_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("acpx_turn_failed");
+    expect((failedRun?.resultJson as Record<string, unknown> | null)?.errorFamily).toBe("provider_quota");
+
+    await expect
+      .poll(
+        () =>
+          db
+            .select({ status: agents.status, errorReason: agents.errorReason })
+            .from(agents)
+            .where(eq(agents.id, agentId))
+            .then((rows) => rows[0] ?? null),
+        { timeout: 5_000, interval: 50 },
+      )
+      .toEqual({ status: "idle", errorReason: null });
+  });
+
+  it("schedules an AI-provider-quota monitor for an ACPX terminal failure via the recovery backstop", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const prefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const now = new Date("2026-07-29T08:00:00.000Z");
+    const expectedRetryAt = parseProviderQuotaResetTime(ACPX_VERBATIM_QUOTA_MESSAGE, now)!;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ACPX Quota Coder",
+      role: "engineer",
+      status: "idle",
+      adapterType: ACPX_QUOTA_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Do the work",
+      status: "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+
+    // Before PPC-3260's server backstop, classifyAdapterFailureForRecovery hard-
+    // rejected any errorCode outside adapter_failed|provider_quota|
+    // configuration_incomplete -- so this ACPX-specific code never reached the
+    // PROVIDER_QUOTA_ERROR_RE text check at all. This is that exact code path.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: ACPX_VERBATIM_QUOTA_MESSAGE,
+      errorCode: "acpx_turn_failed",
+      finishedAt: now,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+    expect(result.providerQuotaMonitored).toBe(1);
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(updatedIssue?.monitorNextCheckAt?.toISOString()).toBe(expectedRetryAt.toISOString());
+    expect(updatedIssue?.executionPolicy).toMatchObject({
+      monitor: {
+        kind: "external_service",
+        serviceName: "AI provider quota",
+        externalRef: runId,
+        nextCheckAt: expectedRetryAt.toISOString(),
+      },
+    });
+
+    const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(updatedRun).toMatchObject({ errorCode: "provider_quota" });
+    expect(updatedRun?.resultJson).toMatchObject({ errorFamily: "provider_quota" });
   });
 
   async function seedMaxTurnFixture(input?: {
