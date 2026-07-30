@@ -98,6 +98,7 @@ import {
   type StartupStepMeasureOptions,
   type StartupTraceContext,
 } from "./startup-timing.js";
+import { isProviderQuotaErrorText, parseProviderQuotaResetTime } from "../provider-quota.js";
 
 const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
 const PAPERCLIP_MANAGED_CODEX_SKILLS_MANIFEST = ".paperclip-managed-skills.json";
@@ -2572,7 +2573,8 @@ function describeErrorDiagnostics(err: unknown): {
 function classifyError(
   err: unknown,
   phase?: AcpxExecutionPhase,
-): Pick<AdapterExecutionResult, "errorCode" | "errorMeta"> {
+  now: Date = new Date(),
+): Pick<AdapterExecutionResult, "errorCode" | "errorMeta" | "errorFamily" | "retryNotBefore"> {
   const message = err instanceof Error ? err.message : String(err);
   const diagnostics = describeErrorDiagnostics(err);
   const { acpCode, errorName, causeMessage, retryable, stackPreview } = diagnostics;
@@ -2590,6 +2592,19 @@ function classifyError(
     return {
       errorCode: "acpx_auth_required",
       errorMeta: { category: "auth", ...baseMeta },
+    };
+  }
+  // PPC-3260: a thrown ACPX error (as opposed to a clean terminal "failed"
+  // result, handled separately above) can still be a provider-quota
+  // exhaustion -- classify it the same adapter-agnostic way before falling
+  // through to the structural acpCode/phase-based codes below.
+  if (isProviderQuotaErrorText(message)) {
+    const retryNotBefore = parseProviderQuotaResetTime(message, now);
+    return {
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      retryNotBefore: retryNotBefore ? retryNotBefore.toISOString() : null,
+      errorMeta: { category: "provider_quota", ...baseMeta },
     };
   }
   const phaseCode = (() => {
@@ -2652,15 +2667,16 @@ async function emitAcpxFailure(input: {
   // acpx.error payload. Used by the turn path to surface the self-describing
   // adapter execution timeout message instead of the raw underlying error.
   messageOverride?: string;
+  now?: Date;
 }): Promise<{
-  classified: Pick<AdapterExecutionResult, "errorCode" | "errorMeta">;
+  classified: Pick<AdapterExecutionResult, "errorCode" | "errorMeta" | "errorFamily" | "retryNotBefore">;
   message: string;
   childStderrTail: string | null;
 }> {
   const { ctx, prepared, err, phase, messageOverride } = input;
   const rawMessage = err instanceof Error ? err.message : String(err);
   const message = messageOverride ?? rawMessage;
-  const classified = classifyError(err, phase);
+  const classified = classifyError(err, phase, input.now);
   const childStderrTail = await readChildStderrTail({ logPath: prepared.childStderrLogPath });
   if (childStderrTail) {
     await ctx.onLog(
@@ -3398,6 +3414,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           prepared,
           err,
           phase: "ensure_session",
+          now: new Date(now()),
         });
         await discardStagedRuntime({ handles: stagedRuntimes, prepared });
         await cleanupRemoteBridges(prepared);
@@ -3452,6 +3469,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           prepared,
           err,
           phase: "configure_session",
+          now: new Date(now()),
         });
         await runtime.close({
           handle: sessionHandle,
@@ -3666,6 +3684,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
           : resultErrorMessage(terminal);
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
+        // PPC-3260: classify provider-quota exhaustion here so the server's
+        // provider-quota subsystem (bounded retry, wait-recovery monitor,
+        // keep-idle-on-failure) actually fires for ACPX -- previously this path
+        // always returned the generic "acpx_turn_failed" code and nothing else.
+        const providerQuota =
+          terminal.status === "failed" && Boolean(errorMessage) && isProviderQuotaErrorText(errorMessage ?? "");
+        const providerQuotaRetryNotBefore = providerQuota
+          ? parseProviderQuotaResetTime(errorMessage ?? "", new Date(now()))
+          : null;
         await emitAcpxLog(ctx, {
           type: terminal.status === "completed" ? "acpx.result" : "acpx.error",
           summary: terminal.status,
@@ -3683,6 +3710,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           timedOut,
           errorMessage,
           errorCode: terminal.status === "failed" ? "acpx_turn_failed" : timedOut ? "acpx_timeout" : null,
+          errorFamily: providerQuota ? "provider_quota" : null,
+          retryNotBefore: providerQuotaRetryNotBefore ? providerQuotaRetryNotBefore.toISOString() : null,
           sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
           sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
           sessionDisplayId: sessionHandle.agentSessionId ?? sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -3733,6 +3762,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           err,
           phase: "turn",
           messageOverride,
+          now: new Date(now()),
         });
         await cleanupRemoteBridges(prepared);
         flushChildStderr(childStderrState);

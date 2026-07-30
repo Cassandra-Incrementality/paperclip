@@ -85,6 +85,21 @@ describe("classifyAdapterFailureForRecovery", () => {
     })).toBeNull();
   });
 
+  it("still text-classifies an unknown/adapter-specific error code as provider_quota (PPC-3260 backstop)", () => {
+    const now = new Date("2026-07-29T08:00:00.000Z");
+    const classification = classifyAdapterFailureForRecovery({
+      errorCode: "acpx_turn_failed",
+      error: "Internal error: You've hit your weekly limit · resets Jul 30 at 12pm (Europe/Rome).",
+      resultJson: null,
+    }, now);
+
+    expect(classification).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-07-30T10:00:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
   it("does not treat a generic capacity limit as provider quota", () => {
     expect(classifyAdapterFailureForRecovery({
       errorCode: "adapter_failed",

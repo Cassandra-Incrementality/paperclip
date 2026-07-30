@@ -1495,6 +1495,7 @@ export function renderPaperclipWakePrompt(
           ? []
           : ["Record the outcome in the resolve call's `resolutionNote`. Any comment you post on the source issue must be ≤3 lines (cause → what you did → hand-back). No headings, no run-by-run narrative."]),
         `Fallback preference order: (1) send back to ${originalAssigneeLabel} with a retry instruction; (2) fix the runtime/adapter/workspace problem, then send it back; (3) reassign to another agent with the right specialty; (4) convert to an explicit manual-review state for the board.`,
+        "Work the source issue. Never create a new sibling issue for this same work (e.g. a \"Resume …\" issue) — every option above acts on this issue directly.",
         "",
       ]
     : includeExecutionContract

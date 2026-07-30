@@ -1004,6 +1004,9 @@ describe("renderPaperclipWakePrompt", () => {
     );
     expect(prompt).toContain(instruction);
     expect(prompt).toContain("Fallback preference order: (1) send back to Coder");
+    expect(prompt).toContain(
+      "Work the source issue. Never create a new sibling issue for this same work",
+    );
     expect(prompt).toContain(`- recovery cause: ${cause}`);
     expect(prompt).toContain("- failure summary: adapter stopped");
     expect(prompt).toContain("- original assignee: Coder");
