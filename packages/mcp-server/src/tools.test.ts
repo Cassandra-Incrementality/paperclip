@@ -374,6 +374,60 @@ describe("paperclip MCP tools", () => {
     });
   });
 
+  it("surfaces a same-agent thread-write guard 409 as a reconcile instruction carrying the conflicting body (PPC-3302)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse(
+        {
+          error: "Concurrent same-agent write to this thread",
+          details: {
+            issueId: "PAP-1135",
+            conflictingRunId: "sibling-run-1",
+            conflictingCommentId: "comment-1",
+            conflictingCommentBody: "Ruling: three-entry spec.",
+            conflictingCreatedAt: "2026-07-31T12:00:00.000Z",
+            guidance:
+              "Another live run of yours already wrote to this thread. Re-read it, reconcile both positions, and post ONE merged comment.",
+          },
+        },
+        409,
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipAddComment");
+    const response = await tool.execute({
+      issueId: "PAP-1135",
+      body: "Ruling: Option 4.",
+    });
+
+    const text = response.content[0]?.text ?? "";
+    expect(text).toContain("Ruling: three-entry spec.");
+    expect(text).toContain("RECONCILE REQUIRED");
+    expect(text.toLowerCase()).toContain("do not retry");
+    // Not just a bare status dump — the raw JSON error shape should not be the whole response.
+    expect(text).not.toMatch(/^\{/);
+  });
+
+  it("does not misclassify an unrelated 409 (e.g. checkout conflict) as a thread-write guard conflict", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse(
+        {
+          error: "Issue checkout conflict",
+          details: { checkoutRunId: "other-run", agentId: "other-agent" },
+        },
+        409,
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipCheckoutIssue");
+    const response = await tool.execute({ issueId: "PAP-1135" });
+
+    const text = response.content[0]?.text ?? "";
+    expect(text).not.toContain("RECONCILE REQUIRED");
+    expect(text).toContain("Issue checkout conflict");
+  });
+
   it("rejects invalid generic request paths", async () => {
     vi.stubGlobal("fetch", vi.fn());
 

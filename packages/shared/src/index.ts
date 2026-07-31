@@ -1405,6 +1405,12 @@ export {
   isClosedIsolatedExecutionWorkspace,
 } from "./execution-workspace-guards.js";
 
+export type { SameAgentThreadConflictDetails } from "./same-agent-thread-conflict.js";
+export {
+  formatSameAgentThreadConflictReconcileInstruction,
+  isSameAgentThreadConflictDetails,
+} from "./same-agent-thread-conflict.js";
+
 export {
   instanceSettingsSchema,
   instanceGeneralSettingsSchema,

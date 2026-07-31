@@ -255,6 +255,43 @@ describe("issue subresource commands", () => {
     const file = (init.body as FormData).get("file") as File;
     expect(file.type).toBe("text/html");
   });
+
+  it("prints a reconcile instruction carrying the conflicting body when the same-agent thread-write guard 409s (PPC-3302)", async () => {
+    const fetchMock = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        jsonResponse(
+          {
+            error: "Concurrent same-agent write to this thread",
+            details: {
+              issueId: ISSUE_ID,
+              conflictingRunId: "sibling-run-1",
+              conflictingCommentId: COMMENT_ID,
+              conflictingCommentBody: "Ruling: three-entry spec.",
+              conflictingCreatedAt: "2026-07-31T12:00:00.000Z",
+              guidance:
+                "Another live run of yours already wrote to this thread. Re-read it, reconcile both positions, and post ONE merged comment.",
+            },
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+      throw new Error(`exit:${code ?? 0}`);
+    }) as typeof process.exit);
+
+    await expect(
+      run(["issue", "comment", ISSUE_ID, "--body", "Ruling: Option 4."]),
+    ).rejects.toThrow("exit:1");
+
+    const rendered = errorSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(rendered).toContain("Ruling: three-entry spec.");
+    expect(rendered).toContain("RECONCILE REQUIRED");
+    expect(rendered.toLowerCase()).toContain("do not retry");
+    expect(rendered).not.toContain('details={"issueId"');
+  });
 });
 
 function jsonResponse(body: unknown = { ok: true }, init: ResponseInit = { status: 200 }): Response {
