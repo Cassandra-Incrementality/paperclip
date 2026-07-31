@@ -122,4 +122,21 @@ describe("heartbeat run scratch cleanup", () => {
     expect(result.env.TMP).toBe(scratch.dir);
     expect(result.tempKeysApplied).toEqual(["TEMP", "TMP"]);
   });
+
+  it("points PAPERCLIP_TASK_SCRATCH_DIR at the task-durable override when one is provided", async () => {
+    const scratch = await trackScratch(await prepareHeartbeatRunScratch({
+      companyId: "company-1",
+      agentId: "agent-1",
+      runId: "run-1",
+    }));
+
+    const result = buildHeartbeatRunScratchEnv({}, scratch, {
+      taskScratchDir: "/tmp/paperclip-task-scratch/issue-1",
+    });
+
+    expect(result.env.PAPERCLIP_RUN_SCRATCH_DIR).toBe(scratch.dir);
+    expect(result.env.PAPERCLIP_TASK_SCRATCH_DIR).toBe("/tmp/paperclip-task-scratch/issue-1");
+    expect(result.env.PAPERCLIP_SCRATCH_DIR).toBe(scratch.dir);
+    expect(result.env.PAPERCLIP_TMPDIR).toBe(scratch.dir);
+  });
 });

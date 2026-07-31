@@ -105,10 +105,14 @@ export async function prepareHeartbeatRunScratch(input: {
 export function buildHeartbeatRunScratchEnv(
   existingEnv: Record<string, unknown>,
   scratch: HeartbeatRunScratch,
+  overrides: { taskScratchDir?: string } = {},
 ): HeartbeatRunScratchEnvResult {
   const env: Record<string, string> = {
     PAPERCLIP_RUN_SCRATCH_DIR: scratch.dir,
-    PAPERCLIP_TASK_SCRATCH_DIR: scratch.dir,
+    // PAPERCLIP_TASK_SCRATCH_DIR is task-durable (see task-scratch.ts) when an
+    // issue-keyed dir is available; only unassigned runs fall back to the
+    // run-scoped dir, matching the historical (pre-task-scratch) behavior.
+    PAPERCLIP_TASK_SCRATCH_DIR: overrides.taskScratchDir ?? scratch.dir,
     PAPERCLIP_SCRATCH_DIR: scratch.dir,
     PAPERCLIP_TMPDIR: scratch.dir,
   };

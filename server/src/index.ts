@@ -114,6 +114,7 @@ import {
   type EmbeddedPostgresSupervisor,
   type SupervisedEmbeddedPostgres,
 } from "./embedded-postgres-supervisor.js";
+import { startHeartbeatTaskScratchRetentionSweep } from "./services/task-scratch.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -1780,7 +1781,12 @@ export async function startServer(): Promise<StartedServer> {
       });
     }, backupIntervalMs);
   }
-  
+
+  // Task-durable scratch (PAPERCLIP_TASK_SCRATCH_DIR) is only reaped by this
+  // sweep — it deliberately outlives individual runs, so it needs its own
+  // retention enforcement independent of run cleanup.
+  startHeartbeatTaskScratchRetentionSweep({ logger });
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
