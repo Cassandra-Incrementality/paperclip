@@ -1,5 +1,9 @@
 import pc from "picocolors";
 import type { Command } from "commander";
+import {
+  formatSameAgentThreadConflictReconcileInstruction,
+  isSameAgentThreadConflictDetails,
+} from "@paperclipai/shared";
 import { getStoredBoardCredential, loginBoardCli } from "../../client/board-auth.js";
 import { buildCliCommandLabel } from "../../client/command-label.js";
 import { readConfig } from "../../config/store.js";
@@ -287,6 +291,14 @@ function readKeyFromProfileEnv(profile: ClientContextProfile): string | undefine
 
 export function handleCommandError(error: unknown): never {
   if (error instanceof ApiRequestError) {
+    // PPC-3302: the same-agent concurrent thread-write guard (PPC-3187) 409s
+    // with the conflicting comment attached — print it as a reconcile
+    // instruction instead of a generic details= JSON dump, or the conflicting
+    // comment's content is easy to miss/lose in agent output.
+    if (error.status === 409 && isSameAgentThreadConflictDetails(error.details)) {
+      console.error(pc.red(formatSameAgentThreadConflictReconcileInstruction(error.details)));
+      process.exit(1);
+    }
     const detailSuffix = error.details !== undefined ? ` details=${JSON.stringify(error.details)}` : "";
     console.error(pc.red(`API error ${error.status}: ${error.message}${detailSuffix}`));
     process.exit(1);
