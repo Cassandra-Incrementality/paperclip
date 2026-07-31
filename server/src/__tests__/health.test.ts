@@ -10,6 +10,7 @@ import * as devServerStatus from "../dev-server-status.js";
 import { serverVersion } from "../version.js";
 
 const mockReadPersistedDevServerStatus = vi.hoisted(() => vi.fn());
+const mockGetQuotaHealthSnapshot = vi.hoisted(() => vi.fn());
 const testServerInfo = {
   processStartedAt: "2026-06-26T00:00:00.000Z",
   git: {
@@ -40,6 +41,10 @@ vi.mock("../dev-server-status.js", () => ({
   toDevServerHealthStatus: vi.fn(),
 }));
 
+vi.mock("../services/quota-windows.js", () => ({
+  getQuotaHealthSnapshot: mockGetQuotaHealthSnapshot,
+}));
+
 function createApp(
   db?: Db,
   serverInfo = testServerInfo,
@@ -64,6 +69,7 @@ describe("GET /health", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockReadPersistedDevServerStatus.mockReturnValue(undefined);
+    mockGetQuotaHealthSnapshot.mockReturnValue(null);
   });
 
   afterEach(() => {
@@ -498,5 +504,68 @@ describe("GET /health", () => {
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
     });
+  });
+
+  it("includes providerQuota in full health details when a snapshot is cached", async () => {
+    const snapshot = {
+      fetchedAt: "2026-07-31T12:00:00.000Z",
+      results: [{ provider: "anthropic", ok: true, windows: [] }],
+    };
+    mockGetQuotaHealthSnapshot.mockReturnValue(snapshot);
+    const app = createApp(createHealthyDb());
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.providerQuota).toEqual(snapshot);
+  });
+
+  it("omits providerQuota (and never invokes the lookup) for redacted, non-full-details responses", async () => {
+    mockGetQuotaHealthSnapshot.mockReturnValue({
+      fetchedAt: "2026-07-31T12:00:00.000Z",
+      results: [{ provider: "anthropic", ok: true, windows: [] }],
+    });
+    const db = {
+      execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({
+          where: vi.fn().mockResolvedValue([{ count: 1 }]),
+        })),
+      })),
+    } as unknown as Db;
+    const app = express();
+    app.use((req, _res, next) => {
+      (req as any).actor = { type: "none", source: "none" };
+      next();
+    });
+    app.use(
+      "/health",
+      healthRoutes(db, {
+        deploymentMode: "authenticated",
+        deploymentExposure: "public",
+        authReady: true,
+        companyDeletionEnabled: false,
+        serverInfo: testServerInfo,
+      }),
+    );
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.providerQuota).toBeUndefined();
+    expect(mockGetQuotaHealthSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("degrades silently and adds no latency when the quota lookup has nothing cached yet", async () => {
+    mockGetQuotaHealthSnapshot.mockReturnValue(null);
+    const app = createApp(createHealthyDb());
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.providerQuota).toBeUndefined();
+    // getQuotaHealthSnapshot is synchronous and called exactly once per request —
+    // the route never awaits the underlying (up to 20s) provider fetch.
+    expect(mockGetQuotaHealthSnapshot).toHaveBeenCalledTimes(1);
   });
 });

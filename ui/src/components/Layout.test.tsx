@@ -122,6 +122,10 @@ vi.mock("./DevRestartBanner", () => ({
   DevRestartBanner: () => null,
 }));
 
+vi.mock("./ProviderQuotaBanner", () => ({
+  ProviderQuotaBanner: () => null,
+}));
+
 vi.mock("./SidebarAccountMenu", () => ({
   SidebarAccountMenu: () => <div>Account menu</div>,
 }));
