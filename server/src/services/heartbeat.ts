@@ -168,6 +168,11 @@ import {
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
 import {
+  HEARTBEAT_TASK_SCRATCH_MARKER,
+  prepareHeartbeatTaskScratch,
+  type HeartbeatTaskScratch,
+} from "./task-scratch.js";
+import {
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
   issueExecutionWorkspaceModeForPersistedWorkspace,
@@ -12832,6 +12837,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     activeRunExecutions.add(run.id);
     let runScratch: HeartbeatRunScratch | null = null;
+    let taskScratch: HeartbeatTaskScratch | null = null;
 
     try {
     const agent = await getAgent(run.agentId);
@@ -13892,8 +13898,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           issueId: issueRef?.id ?? null,
           issueIdentifier: issueRef?.identifier ?? null,
         });
+        if (issueRef?.id) {
+          try {
+            taskScratch = await prepareHeartbeatTaskScratch({
+              companyId: agent.companyId,
+              issueId: issueRef.id,
+              issueIdentifier: issueRef.identifier ?? null,
+            });
+          } catch (taskScratchPrepareError) {
+            taskScratch = null;
+            logger.warn(
+              {
+                err: taskScratchPrepareError,
+                runId: run.id,
+                issueId,
+                agentId: agent.id,
+              },
+              "failed to prepare task-durable scratch directory; PAPERCLIP_TASK_SCRATCH_DIR will fall back to the run scratch dir",
+            );
+          }
+        } else {
+          taskScratch = null;
+        }
         const existingRuntimeEnv = parseObject(runtimeConfig.env);
-        const scratchEnv = buildHeartbeatRunScratchEnv(existingRuntimeEnv, runScratch);
+        const scratchEnv = buildHeartbeatRunScratchEnv(existingRuntimeEnv, runScratch, {
+          taskScratchDir: taskScratch?.dir,
+        });
         runtimeConfig = {
           ...runtimeConfig,
           env: {
@@ -13908,9 +13938,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           marker: HEARTBEAT_RUN_SCRATCH_MARKER,
           tempKeysApplied: scratchEnv.tempKeysApplied,
         };
+        if (taskScratch) {
+          context.paperclipTaskScratch = {
+            type: "issue_task",
+            dir: taskScratch.dir,
+            cleanupPolicy: "retention_sweep",
+            marker: HEARTBEAT_TASK_SCRATCH_MARKER,
+          };
+        } else {
+          delete context.paperclipTaskScratch;
+        }
       } catch (scratchPrepareError) {
         runScratch = null;
+        taskScratch = null;
         delete context.paperclipScratch;
+        delete context.paperclipTaskScratch;
         logger.warn(
           {
             err: scratchPrepareError,
@@ -13923,6 +13965,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     } else {
       delete context.paperclipScratch;
+      delete context.paperclipTaskScratch;
     }
     context.paperclipEnvironment = {
       id: selectedEnvironment.id,

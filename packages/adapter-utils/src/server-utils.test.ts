@@ -857,6 +857,19 @@ describe("renderPaperclipWakePrompt", () => {
     );
   });
 
+  it("tells agents the truth about which scratch dir is run-scoped vs task-durable", () => {
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
+      "removes that run-owned directory after the run ends, even on failure",
+    );
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain("PAPERCLIP_TASK_SCRATCH_DIR");
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
+      "it is keyed on this issue, not this run",
+    );
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain(
+      "not cleaned up when a run ends",
+    );
+  });
+
   it("leaves the execution contract to the heartbeat template on fresh scoped wake prompts", () => {
     const prompt = renderPaperclipWakePrompt({
       reason: "issue_assigned",
