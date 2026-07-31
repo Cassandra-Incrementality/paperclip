@@ -325,6 +325,10 @@ const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
+// PPC-3291: config-driven cooldown/attempt bound for the errored-agent
+// auto-recovery sweep (reconcileErroredAgents).
+const RECONCILE_ERRORED_AGENTS_DEFAULT_COOLDOWN_MS = 30 * 60 * 1000;
+const RECONCILE_ERRORED_AGENTS_DEFAULT_MAX_ATTEMPTS = 3;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
@@ -444,6 +448,44 @@ function readHeartbeatRunErrorFamily(
     run.errorCode === "claude_transient_upstream" ||
     run.errorCode === "codex_harness_crash"
   ) {
+    return "transient_upstream";
+  }
+  return null;
+}
+
+// Agent-scoped recovery (reconcileErroredAgents) only has the persisted
+// `errorReason` text on the agent row to work from — no run/errorCode to
+// join against. Reuses the same two families as readHeartbeatRunErrorFamily
+// (provider_quota, transient_upstream) so both classifiers agree on what
+// "retryable" means; matches the literal strings observed in production
+// (PPC-3290/PPC-3291) plus generic upstream-outage phrasing.
+const AGENT_ERROR_REASON_PROVIDER_QUOTA_PATTERNS = [
+  /session limit/i,
+  /rate limit/i,
+  /quota/i,
+  /usage limit/i,
+];
+const AGENT_ERROR_REASON_TRANSIENT_UPSTREAM_PATTERNS = [
+  /5\d\d\b.*\b(error|status)/i,
+  /overloaded/i,
+  /timed?\s?out/i,
+  /timeout/i,
+  /econnreset/i,
+  /econnrefused/i,
+  /upstream/i,
+  /temporarily unavailable/i,
+  /internal error/i,
+];
+
+export function classifyAgentErrorReasonFamily(
+  errorReason: string | null | undefined,
+): "provider_quota" | "transient_upstream" | null {
+  const normalized = readNonEmptyString(errorReason);
+  if (!normalized) return null;
+  if (AGENT_ERROR_REASON_PROVIDER_QUOTA_PATTERNS.some((pattern) => pattern.test(normalized))) {
+    return "provider_quota";
+  }
+  if (AGENT_ERROR_REASON_TRANSIENT_UPSTREAM_PATTERNS.some((pattern) => pattern.test(normalized))) {
     return "transient_upstream";
   }
   return null;
@@ -12123,6 +12165,115 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
+  /**
+   * Agent-scoped recovery sweep for PPC-3291. `status='error'` is otherwise an
+   * absorbing state for the ~29/33 agents with no heartbeat timer
+   * (`parseHeartbeatPolicy` defaults `enabled: false`): the only automatic
+   * retry is issue-scoped and gets cancelled the moment work routes around
+   * the dead agent. This job is deliberately agent-scoped and
+   * issue-independent so it still runs for agents nobody is assigning work to.
+   *
+   * Bounded via a per-agent attempt counter + exponential backoff persisted
+   * in `agents.metadata.errorRecovery` so a genuinely broken agent stops
+   * flapping idle/error and is left in `error` for the existing
+   * `agent_error_alert` attention path to surface to a human.
+   */
+  async function reconcileErroredAgents(
+    now = new Date(),
+    opts?: { cooldownMs?: number; maxAttempts?: number },
+  ) {
+    const cooldownMs = opts?.cooldownMs ?? RECONCILE_ERRORED_AGENTS_DEFAULT_COOLDOWN_MS;
+    const maxAttempts = opts?.maxAttempts ?? RECONCILE_ERRORED_AGENTS_DEFAULT_MAX_ATTEMPTS;
+    const cooldownCutoff = new Date(now.getTime() - cooldownMs);
+
+    const candidates = await db
+      .select()
+      .from(agents)
+      .where(and(eq(agents.status, "error"), lt(agents.updatedAt, cooldownCutoff)));
+
+    let cleared = 0;
+    let skippedExhausted = 0;
+    let skippedUnclassified = 0;
+    const clearedAgentIds: string[] = [];
+
+    for (const agent of candidates) {
+      const family = classifyAgentErrorReasonFamily(agent.errorReason);
+      if (!family) {
+        skippedUnclassified += 1;
+        continue;
+      }
+
+      const metadata = parseObject(agent.metadata);
+      const recovery = parseObject((metadata as Record<string, unknown>).errorRecovery);
+      const attempts = asNumber(recovery.attempts, 0);
+      const nextEligibleAtRaw = readNonEmptyString(recovery.nextEligibleAt);
+      const nextEligibleAt = nextEligibleAtRaw ? new Date(nextEligibleAtRaw) : null;
+      if (nextEligibleAt && !Number.isNaN(nextEligibleAt.getTime()) && nextEligibleAt.getTime() > now.getTime()) {
+        continue;
+      }
+
+      if (attempts >= maxAttempts) {
+        skippedExhausted += 1;
+        continue;
+      }
+
+      const nextAttempts = attempts + 1;
+      const backoffMs = cooldownMs * Math.pow(2, attempts);
+      const nextMetadata = {
+        ...metadata,
+        errorRecovery: {
+          ...recovery,
+          attempts: nextAttempts,
+          family,
+          lastAttemptAt: now.toISOString(),
+          nextEligibleAt: new Date(now.getTime() + backoffMs).toISOString(),
+        },
+      };
+
+      // Mirror agentsService.clearError's CAS semantics exactly: only clear
+      // when the row is still 'error' at write time, so a concurrent sweep
+      // invocation (or a run that already recovered the agent) can never be
+      // clobbered.
+      const updated = await db
+        .update(agents)
+        .set({
+          status: "idle",
+          errorReason: null,
+          metadata: nextMetadata,
+          updatedAt: now,
+        })
+        .where(and(eq(agents.id, agent.id), eq(agents.status, "error")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (updated) {
+        cleared += 1;
+        clearedAgentIds.push(agent.id);
+        publishLiveEvent({
+          companyId: updated.companyId,
+          type: "agent.status",
+          payload: {
+            agentId: updated.id,
+            status: updated.status,
+            lastHeartbeatAt: updated.lastHeartbeatAt
+              ? new Date(updated.lastHeartbeatAt).toISOString()
+              : null,
+            outcome: "error_recovery_sweep",
+          },
+        });
+      }
+    }
+
+    if (cleared > 0) {
+      logger.info(
+        { cleared, clearedAgentIds, skippedExhausted, skippedUnclassified },
+        "reconcileErroredAgents auto-recovery sweep cleared errored agents",
+      );
+    }
+
+    return { cleared, clearedAgentIds, skippedExhausted, skippedUnclassified, candidates: candidates.length };
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -17791,6 +17942,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     reapOrphanedRuns,
+    reconcileErroredAgents,
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
     // gate on suppression should prefer this over the env-only resolver.

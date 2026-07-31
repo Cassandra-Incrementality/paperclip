@@ -1017,6 +1017,11 @@ export async function startServer(): Promise<StartedServer> {
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
         }
+
+        const erroredAgentsReconciled = await heartbeat.reconcileErroredAgents();
+        if (erroredAgentsReconciled.cleared > 0) {
+          logger.warn({ ...erroredAgentsReconciled }, "startup errored-agent auto-recovery sweep cleared agents");
+        }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
@@ -1178,6 +1183,12 @@ export async function startServer(): Promise<StartedServer> {
               const reviewed = await heartbeat.reconcileProductivityReviews();
               if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
                 logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
+              }
+            })
+            .then(async () => {
+              const erroredAgentsReconciled = await heartbeat.reconcileErroredAgents();
+              if (erroredAgentsReconciled.cleared > 0) {
+                logger.warn({ ...erroredAgentsReconciled }, "periodic errored-agent auto-recovery sweep cleared agents");
               }
             })
             .catch((err) => {

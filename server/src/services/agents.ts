@@ -586,6 +586,54 @@ export function agentService(db: Db) {
 
     getById,
 
+    // PPC-3291 Part B: dead-agent instrumentation. We only found the errored
+    // agents in PPC-3290 by hand-probing the plain agent list, so surface
+    // status counts + per-error age here for the daily health check (PPC-3256)
+    // to consume once it lands, and standalone in the meantime.
+    getErrorHealthSummary: async (companyId: string, options?: { staleAfterHours?: number }) => {
+      const staleAfterHours = options?.staleAfterHours ?? 24;
+      const rows = await db
+        .select({
+          id: agents.id,
+          name: agents.name,
+          status: agents.status,
+          errorReason: agents.errorReason,
+          updatedAt: agents.updatedAt,
+        })
+        .from(agents)
+        .where(eq(agents.companyId, companyId));
+
+      const statusCounts: Record<string, number> = {};
+      for (const row of rows) {
+        statusCounts[row.status] = (statusCounts[row.status] ?? 0) + 1;
+      }
+
+      const now = Date.now();
+      const staleAfterMs = staleAfterHours * 60 * 60 * 1000;
+      const erroredAgents = rows
+        .filter((row) => row.status === "error")
+        .map((row) => {
+          const errorSinceMs = row.updatedAt ? new Date(row.updatedAt).getTime() : now;
+          const ageHours = Math.max(0, (now - errorSinceMs) / (60 * 60 * 1000));
+          return {
+            id: row.id,
+            name: row.name,
+            errorReason: row.errorReason,
+            errorSince: row.updatedAt ? new Date(row.updatedAt).toISOString() : null,
+            ageHours: Math.round(ageHours * 10) / 10,
+            stale: now - errorSinceMs > staleAfterMs,
+          };
+        })
+        .sort((a, b) => b.ageHours - a.ageHours);
+
+      return {
+        companyId,
+        statusCounts,
+        erroredAgents,
+        staleErroredAgentCount: erroredAgents.filter((a) => a.stale).length,
+      };
+    },
+
     create: async (companyId: string, data: Omit<typeof agents.$inferInsert, "companyId">, options?: CreateAgentOptions) => {
       assertBuiltInAgentMetadataMutationAllowed(null, data.metadata, options);
       if (data.reportsTo) {
