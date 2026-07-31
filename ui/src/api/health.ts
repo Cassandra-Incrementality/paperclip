@@ -1,4 +1,9 @@
-import type { ServerInfoSnapshot } from "@paperclipai/shared";
+import type { ProviderQuotaResult, ServerInfoSnapshot } from "@paperclipai/shared";
+
+export type ProviderQuotaHealthStatus = {
+  fetchedAt: string;
+  results: ProviderQuotaResult[];
+};
 
 export type DevServerHealthStatus = {
   enabled: true;
@@ -41,6 +46,7 @@ export type HealthStatus = {
    * settings-visibility registry). Absent when nothing is hidden.
    */
   hiddenSettings?: string[];
+  providerQuota?: ProviderQuotaHealthStatus;
 };
 
 export const healthApi = {

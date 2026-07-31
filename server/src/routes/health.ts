@@ -27,6 +27,7 @@ import {
   WORKSPACE_READINESS_USER_EMAIL_HEADER,
   WORKSPACE_READINESS_USER_ID_HEADER,
 } from "../auth/workspace-login-handoff.js";
+import { getQuotaHealthSnapshot } from "../services/quota-windows.js";
 import { serverVersion } from "../version.js";
 
 function shouldExposeFullHealthDetails(
@@ -296,6 +297,10 @@ export function healthRoutes(
       ? inspectDatabaseBackupHealth(opts.databaseBackupHealth)
       : undefined;
     const warnings = databaseBackup?.warnings.length ? databaseBackup.warnings : undefined;
+    // Full-details only: reads a TTL-cached snapshot synchronously and never
+    // awaits the live provider fetch (up to 20s), so a slow/hung provider CLI
+    // never adds latency to this response — see getQuotaHealthSnapshot().
+    const providerQuota = exposeFullDetails ? getQuotaHealthSnapshot() ?? undefined : undefined;
 
     if (!exposeFullDetails) {
       const redactedDatabaseBackup = databaseBackup ? redactedDatabaseBackupHealth(databaseBackup) : undefined;
@@ -340,6 +345,7 @@ export function healthRoutes(
       ...(workspaceReadiness ? { workspace: workspaceReadiness } : {}),
       ...(cloud ? { cloud } : {}),
       ...(hiddenSettings.length ? { hiddenSettings } : {}),
+      ...(providerQuota ? { providerQuota } : {}),
     });
   });
 

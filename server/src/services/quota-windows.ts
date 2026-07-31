@@ -1,5 +1,6 @@
 import type { ProviderQuotaResult } from "@paperclipai/shared";
 import { listServerAdapters } from "../adapters/registry.js";
+import { logger } from "../middleware/logger.js";
 
 const QUOTA_PROVIDER_TIMEOUT_MS = 20_000;
 
@@ -61,4 +62,52 @@ async function withQuotaTimeout(
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
   }
+}
+
+export type QuotaHealthSnapshot = {
+  fetchedAt: string;
+  results: ProviderQuotaResult[];
+};
+
+const QUOTA_HEALTH_CACHE_TTL_MS = 30_000;
+
+let quotaHealthCache: { snapshot: QuotaHealthSnapshot; expiresAt: number } | null = null;
+let quotaHealthRefreshInFlight: Promise<void> | null = null;
+
+function refreshQuotaHealthCache(now: number): Promise<void> {
+  if (quotaHealthRefreshInFlight) return quotaHealthRefreshInFlight;
+  quotaHealthRefreshInFlight = fetchAllQuotaWindows()
+    .then((results) => {
+      quotaHealthCache = {
+        snapshot: { fetchedAt: new Date(now).toISOString(), results },
+        expiresAt: now + QUOTA_HEALTH_CACHE_TTL_MS,
+      };
+    })
+    .catch((error) => {
+      logger.warn({ err: error }, "Provider quota health refresh failed");
+    })
+    .finally(() => {
+      quotaHealthRefreshInFlight = null;
+    });
+  return quotaHealthRefreshInFlight;
+}
+
+/**
+ * Non-blocking read for the /api/health route. fetchAllQuotaWindows() shells out
+ * to provider CLIs with a QUOTA_PROVIDER_TIMEOUT_MS-bounded (20s) wait, far too
+ * slow to await inline in a health response, so this always returns synchronously
+ * from cache (or null before the first successful fetch) and kicks a deduped
+ * background refresh when the cache is stale or missing.
+ */
+export function getQuotaHealthSnapshot(opts: { now?: number } = {}): QuotaHealthSnapshot | null {
+  const now = opts.now ?? Date.now();
+  if (!quotaHealthCache || now >= quotaHealthCache.expiresAt) {
+    void refreshQuotaHealthCache(now);
+  }
+  return quotaHealthCache?.snapshot ?? null;
+}
+
+export function resetQuotaHealthCacheForTests(): void {
+  quotaHealthCache = null;
+  quotaHealthRefreshInFlight = null;
 }
