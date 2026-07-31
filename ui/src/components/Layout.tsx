@@ -18,6 +18,7 @@ import { ToastViewport } from "./ToastViewport";
 import { MobileBottomNav } from "./MobileBottomNav";
 import { WorktreeBanner } from "./WorktreeBanner";
 import { DevRestartBanner } from "./DevRestartBanner";
+import { ProviderQuotaBanner } from "./ProviderQuotaBanner";
 import { StandaloneBrowserControls } from "./StandaloneBrowserControls";
 import { RouteErrorBoundary } from "./RouteErrorBoundary";
 import { SidebarShell } from "./SidebarShell";
@@ -60,6 +61,9 @@ function getCompanyPathSegments(pathname: string, companyPrefix: string | undefi
 }
 
 const RESERVED_APP_SUBPATHS = new Set(["browse", "connect", "review", "attention", "gateways", "advanced", "app"]);
+
+// Matches the server's quota health cache TTL (server/src/services/quota-windows.ts).
+const PROVIDER_QUOTA_HEALTH_POLL_MS = 30_000;
 
 function isSkillsStoreRoute(pathname: string, companyPrefix: string | undefined) {
   const segments = pathname.split("/").filter(Boolean);
@@ -180,7 +184,10 @@ export function Layout() {
     retry: false,
     refetchInterval: (query) => {
       const data = query.state.data as { devServer?: { enabled?: boolean } } | undefined;
-      return data?.devServer?.enabled ? 2000 : false;
+      // devServer.enabled polls fast for near-instant restart-required feedback in
+      // dev; otherwise still poll at a modest cadence so the provider-quota banner
+      // can appear/clear on its own (matches the server's quota cache TTL).
+      return data?.devServer?.enabled ? 2000 : PROVIDER_QUOTA_HEALTH_POLL_MS;
     },
     refetchIntervalInBackground: true,
   });
@@ -552,6 +559,7 @@ export function Layout() {
       </a>
       <WorktreeBanner />
       <DevRestartBanner devServer={health?.devServer} />
+      <ProviderQuotaBanner providerQuota={health?.providerQuota} />
       <div className={cn("min-h-0 flex-1", isMobile ? "w-full" : "flex overflow-clip")}>
         {isMobile && sidebarOpen && (
           <button

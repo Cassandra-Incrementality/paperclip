@@ -21,19 +21,26 @@ function normalizeLabel(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
+/** percent-used threshold at which a quota window is considered at/near cap */
+export const QUOTA_USED_PERCENT_WARNING_THRESHOLD = 90;
+
+export function formatQuotaResetTime(resetsAt: string | null): string | null {
+  if (!resetsAt) return null;
+  const date = new Date(resetsAt);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
+}
+
 function detailText(window: QuotaWindow): string | null {
   if (typeof window.detail === "string" && window.detail.trim().length > 0) return window.detail.trim();
-  if (window.resetsAt) {
-    const formatted = new Date(window.resetsAt).toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-      timeZoneName: "short",
-    });
-    return `Resets ${formatted}`;
-  }
-  return null;
+  const formatted = formatQuotaResetTime(window.resetsAt);
+  return formatted ? `Resets ${formatted}` : null;
 }
 
 function orderedWindows(windows: QuotaWindow[]): QuotaWindow[] {
@@ -46,7 +53,7 @@ function orderedWindows(windows: QuotaWindow[]): QuotaWindow[] {
 
 function fillClass(usedPercent: number | null): string {
   if (usedPercent == null) return "bg-zinc-700";
-  if (usedPercent >= 90) return "bg-(--status-task-blocked)";
+  if (usedPercent >= QUOTA_USED_PERCENT_WARNING_THRESHOLD) return "bg-(--status-task-blocked)";
   if (usedPercent >= 70) return "bg-(--status-task-todo)";
   return "bg-primary/70";
 }
