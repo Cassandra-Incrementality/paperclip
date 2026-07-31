@@ -33,7 +33,7 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
 } from "../services/heartbeat.ts";
-import { recoveryService } from "../services/recovery/service.ts";
+import { PROVIDER_QUOTA_RECOVERY_MAX_HORIZON_MS, recoveryService } from "../services/recovery/service.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -445,23 +445,119 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
 
-    const result = await recovery.reconcileStrandedAssignedIssues();
-    expect(result.providerQuotaMonitored).toBe(1);
+    // PPC-3303: reconcileStrandedAssignedIssues() reads the real wall clock
+    // internally, but expectedRetryAt above was computed against a frozen
+    // `now`. The reset message has no year, so once the real clock passes the
+    // embedded "Jul 30" date, parsing it against the real clock silently
+    // diverges from parsing it against the frozen one -- this test passed
+    // 2026-07-29/07-30 and started failing 2026-07-31 for exactly that reason.
+    // Freeze Date (not the other timers -- afterEach's cleanup retry loop
+    // needs real setTimeout) to the same instant so both sides agree
+    // regardless of the real calendar date.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
+    try {
+      const result = await recovery.reconcileStrandedAssignedIssues();
+      expect(result.providerQuotaMonitored).toBe(1);
 
-    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(updatedIssue?.monitorNextCheckAt?.toISOString()).toBe(expectedRetryAt.toISOString());
-    expect(updatedIssue?.executionPolicy).toMatchObject({
-      monitor: {
-        kind: "external_service",
-        serviceName: "AI provider quota",
-        externalRef: runId,
-        nextCheckAt: expectedRetryAt.toISOString(),
-      },
+      const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(updatedIssue?.monitorNextCheckAt?.toISOString()).toBe(expectedRetryAt.toISOString());
+      expect(updatedIssue?.executionPolicy).toMatchObject({
+        monitor: {
+          kind: "external_service",
+          serviceName: "AI provider quota",
+          externalRef: runId,
+          nextCheckAt: expectedRetryAt.toISOString(),
+        },
+      });
+
+      const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(updatedRun).toMatchObject({ errorCode: "provider_quota" });
+      expect(updatedRun?.resultJson).toMatchObject({ errorFamily: "provider_quota" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clamps an absurdly far-out retryAt to the max horizon before it reaches monitorNextCheckAt (PPC-3303)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const prefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const now = new Date("2026-07-29T08:00:00.000Z");
+    const absurdRetryAt = new Date("2030-01-01T00:00:00.000Z");
+    const expectedClampedRetryAt = new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_MAX_HORIZON_MS);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: prefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
     });
 
-    const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    expect(updatedRun).toMatchObject({ errorCode: "provider_quota" });
-    expect(updatedRun?.resultJson).toMatchObject({ errorFamily: "provider_quota" });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Quota Clamp Coder",
+      role: "engineer",
+      status: "idle",
+      adapterType: ACPX_QUOTA_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Do the work",
+      status: "in_progress",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${prefix}-1`,
+    });
+
+    // Bypasses the parser entirely (persisted-retry read path in
+    // classifyAdapterFailureForRecovery) so this exercises the
+    // scheduleProviderQuotaRecoveryMonitor clamp on its own -- a correctly- or
+    // incorrectly-parsed retryAt must never reach monitorNextCheckAt unclamped.
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "Provider quota exceeded for this model.",
+      errorCode: "provider_quota",
+      resultJson: { providerQuotaRetryNotBefore: absurdRetryAt.toISOString() },
+      finishedAt: now,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
+    try {
+      const result = await recovery.reconcileStrandedAssignedIssues();
+      expect(result.providerQuotaMonitored).toBe(1);
+
+      const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(updatedIssue?.monitorNextCheckAt?.toISOString()).toBe(expectedClampedRetryAt.toISOString());
+      expect(updatedIssue?.monitorNextCheckAt?.getTime()).toBeLessThan(absurdRetryAt.getTime());
+      expect(updatedIssue?.executionPolicy).toMatchObject({
+        monitor: { nextCheckAt: expectedClampedRetryAt.toISOString() },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   async function seedMaxTurnFixture(input?: {

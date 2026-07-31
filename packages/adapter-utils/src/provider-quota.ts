@@ -37,6 +37,17 @@ export const PROVIDER_QUOTA_ERROR_RE =
 const RESET_TIME_RE =
   /(?:try again at|resets?)\s+(?:([A-Za-z]{3,9})\s+(\d{1,2})\s+)?(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?\s*m\.?)?(?:\s*\(([^)]+)\)|\s+([A-Z]{2,5}))?/i;
 
+// An explicit month/day reset that has already passed is ambiguous: it could be
+// a genuine year-wrap ("resets Jan 2" read on Dec 31 -- the quota window really
+// is ~1 year out) or it could mean the quota has simply already reset (the
+// common case for stranded-issue sweeps, which by definition run long after the
+// original error text was captured). Only the former should roll forward a
+// year; the latter should return null so the caller falls back to its short
+// default backoff instead of parking the issue for up to 365 days (PPC-3303).
+// 60 days cleanly separates "just passed" (hours/days stale) from "wrapped the
+// calendar year" (typically ~300+ days stale).
+const EXPLICIT_DATE_YEAR_WRAP_MIN_PAST_MS = 60 * 24 * 60 * 60 * 1000;
+
 export function isProviderQuotaErrorText(text: string): boolean {
   return PROVIDER_QUOTA_ERROR_RE.test(text);
 }
@@ -98,8 +109,10 @@ function timeZoneWallClockDate(now: Date, timeZone: string): { year: number; mon
 /**
  * Parses provider-quota reset phrasing out of raw adapter error text, e.g.
  * "try again at 4:30 PM (America/Chicago)" or "resets Jul 30 at 12pm
- * (Europe/Rome)". Returns null when no reset time can be extracted -- callers
- * should fall back to a fixed backoff in that case.
+ * (Europe/Rome)". Returns null when no reset time can be extracted, or when an
+ * explicit month/day reset has only recently passed (see
+ * EXPLICIT_DATE_YEAR_WRAP_MIN_PAST_MS) -- callers should fall back to a fixed
+ * backoff in either case.
  *
  * When no timezone is present the reset clock is treated as UTC (see module
  * comment for why this is standardised rather than server-local).
@@ -129,7 +142,10 @@ export function parseProviderQuotaResetTime(text: string, now: Date): Date | nul
   if (!timeZone) {
     if (hasExplicitDate) {
       const retryAt = new Date(Date.UTC(now.getUTCFullYear(), explicitMonth, explicitDay, hour, minute));
-      if (retryAt.getTime() <= now.getTime()) retryAt.setUTCFullYear(retryAt.getUTCFullYear() + 1);
+      if (retryAt.getTime() <= now.getTime()) {
+        if (now.getTime() - retryAt.getTime() < EXPLICIT_DATE_YEAR_WRAP_MIN_PAST_MS) return null;
+        retryAt.setUTCFullYear(retryAt.getUTCFullYear() + 1);
+      }
       return retryAt;
     }
     const retryAt = new Date(now);
@@ -149,6 +165,7 @@ export function parseProviderQuotaResetTime(text: string, now: Date): Date | nul
         timeZone,
       });
       if (thisYear.getTime() > now.getTime()) return thisYear;
+      if (now.getTime() - thisYear.getTime() < EXPLICIT_DATE_YEAR_WRAP_MIN_PAST_MS) return null;
       return resolveWallClockInTimeZone({
         year: now.getUTCFullYear() + 1,
         month: explicitMonth,

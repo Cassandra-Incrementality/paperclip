@@ -383,6 +383,12 @@ const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
+// Defense in depth (PPC-3303): even a correctly-parsed provider reset time
+// should never park an issue's monitor further out than this, adapter-agnostic,
+// so a future parser bug can't strand the fleet the way the year-rollover bug
+// did. No provider quota window observed so far exceeds a week; this caps well
+// inside that while still comfortably covering weekly resets.
+export const PROVIDER_QUOTA_RECOVERY_MAX_HORIZON_MS = 48 * 60 * 60 * 1000;
 
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
@@ -3549,11 +3555,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     issue: typeof issues.$inferSelect;
     latestRun: NonNullable<LatestIssueRun>;
     classification: Extract<NonNullable<AdapterFailureRecoveryClassification>, { kind: "provider_quota" }>;
+    now: Date;
   }) {
     if (input.issue.status !== "in_progress" && input.issue.status !== "in_review") return null;
 
     const targetAgentId = getAdapterFailureRecoveryTargetAgentId(input.issue);
     if (!targetAgentId || input.latestRun.agentId !== targetAgentId) return null;
+
+    // PPC-3303: clamp regardless of how the classification arrived at retryAt --
+    // a correctly-parsed reset time should never park an issue's monitor beyond
+    // this horizon, and a mis-parsed one (the year-rollover bug) must not either.
+    const maxRetryAt = new Date(input.now.getTime() + PROVIDER_QUOTA_RECOVERY_MAX_HORIZON_MS);
+    const retryAt = input.classification.retryAt.getTime() > maxRetryAt.getTime()
+      ? maxRetryAt
+      : input.classification.retryAt;
 
     const previousPolicy = normalizeIssueExecutionPolicy(input.issue.executionPolicy ?? null);
     const retryTargetDescription = input.issue.status === "in_review"
@@ -3562,7 +3577,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const policy = {
       ...(previousPolicy ?? { mode: "normal" as const, commentRequired: true, stages: [] }),
       monitor: {
-        nextCheckAt: input.classification.retryAt.toISOString(),
+        nextCheckAt: retryAt.toISOString(),
         notes: input.classification.parsedResetTime
           ? `Provider usage quota reached; retry ${retryTargetDescription} at the provider reset time.`
           : `Provider usage quota reached; retry ${retryTargetDescription} after the default recovery backoff.`,
@@ -3604,7 +3619,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         source: "recovery.provider_quota",
         latestRunId: input.latestRun.id,
         errorCode: "provider_quota",
-        nextCheckAt: input.classification.retryAt.toISOString(),
+        nextCheckAt: retryAt.toISOString(),
         parsedResetTime: input.classification.parsedResetTime,
         targetAgentId,
       },
@@ -3763,6 +3778,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             issue,
             latestRun,
             classification: adapterFailureClassification,
+            now: recoveryNow,
           });
           if (monitored) {
             latestRun = await persistAdapterFailureRecoveryClassification(latestRun, adapterFailureClassification);
@@ -3924,6 +3940,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             issue,
             latestRun: participantLatestRun,
             classification: participantAdapterFailureClassification,
+            now: recoveryNow,
           });
           if (monitored) {
             latestRun = await persistAdapterFailureRecoveryClassification(
