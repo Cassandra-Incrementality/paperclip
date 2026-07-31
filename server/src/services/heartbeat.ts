@@ -216,7 +216,7 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
-import { recoveryService } from "./recovery/service.js";
+import { recoveryService, isUniqueStrandedIssueRecoveryConflict } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
@@ -6176,6 +6176,28 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+export interface IssueMonitorDispatchRow {
+  id: string;
+  companyId: string;
+  projectId: string | null;
+  goalId: string | null;
+  identifier: string | null;
+  title: string;
+  status: string;
+  priority: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  billingCode: string | null;
+  executionPolicy: Record<string, unknown> | null;
+  executionState: Record<string, unknown> | null;
+  monitorNextCheckAt: Date | null;
+  monitorWakeRequestedAt: Date | null;
+  monitorLastTriggeredAt: Date | null;
+  monitorAttemptCount: number | null;
+  monitorNotes: string | null;
+  monitorScheduledBy: string | null;
+}
+
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
@@ -7045,28 +7067,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     monitorScheduledBy: issues.monitorScheduledBy,
   };
 
-  interface IssueMonitorDispatchRow {
-    id: string;
-    companyId: string;
-    projectId: string | null;
-    goalId: string | null;
-    identifier: string | null;
-    title: string;
-    status: string;
-    priority: string;
-    assigneeAgentId: string | null;
-    assigneeUserId: string | null;
-    billingCode: string | null;
-    executionPolicy: Record<string, unknown> | null;
-    executionState: Record<string, unknown> | null;
-    monitorNextCheckAt: Date | null;
-    monitorWakeRequestedAt: Date | null;
-    monitorLastTriggeredAt: Date | null;
-    monitorAttemptCount: number | null;
-    monitorNotes: string | null;
-    monitorScheduledBy: string | null;
-  }
-
   function parseMonitorDate(value: string | null | undefined) {
     if (!value) return null;
     const date = new Date(value);
@@ -7190,26 +7190,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (input.recoveryPolicy === "create_recovery_issue") {
       let recoveryIssue = await findOpenIssueMonitorRecoveryIssue(input.claimed);
       if (!recoveryIssue) {
-        recoveryIssue = await issuesSvc.create(input.claimed.companyId, {
-          title: `Recover external-service monitor for ${input.claimed.identifier ?? input.claimed.title}`,
-          description: monitorRecoveryComment({
-            issue: input.claimed,
-            clearReason: input.clearReason,
-            recoveryPolicy: input.recoveryPolicy,
-            nextAttemptCount: input.nextAttemptCount,
-          }),
-          status: "todo",
-          priority: "high",
-          parentId: input.claimed.id,
-          projectId: input.claimed.projectId,
-          goalId: input.claimed.goalId,
-          assigneeAgentId: input.claimed.assigneeAgentId,
-          assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
-          originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
-          originId: input.claimed.id,
-          originFingerprint: `issue_monitor:${input.clearReason}`,
-          billingCode: input.claimed.billingCode,
-        });
+        try {
+          recoveryIssue = await issuesSvc.create(input.claimed.companyId, {
+            title: `Recover external-service monitor for ${input.claimed.identifier ?? input.claimed.title}`,
+            description: monitorRecoveryComment({
+              issue: input.claimed,
+              clearReason: input.clearReason,
+              recoveryPolicy: input.recoveryPolicy,
+              nextAttemptCount: input.nextAttemptCount,
+            }),
+            status: "todo",
+            priority: "high",
+            parentId: input.claimed.id,
+            projectId: input.claimed.projectId,
+            goalId: input.claimed.goalId,
+            assigneeAgentId: input.claimed.assigneeAgentId,
+            assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
+            originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
+            originId: input.claimed.id,
+            originFingerprint: `issue_monitor:${input.clearReason}`,
+            billingCode: input.claimed.billingCode,
+          });
+        } catch (error) {
+          if (!isUniqueStrandedIssueRecoveryConflict(error)) throw error;
+          const raced = await findOpenIssueMonitorRecoveryIssue(input.claimed);
+          if (!raced) throw error;
+          recoveryIssue = raced;
+        }
       }
 
       if (recoveryIssue.assigneeAgentId) {
@@ -18161,6 +18168,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     wakeup: trackWakeup,
     triggerIssueMonitor,
+    performIssueMonitorRecovery,
 
     reportRunActivity: clearDetachedRunWarning,
 

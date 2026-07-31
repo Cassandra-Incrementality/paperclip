@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import {
@@ -487,6 +487,88 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       assigneeAdapterOverrides: { modelProfile: "cheap" },
     });
     expect(["todo", "in_progress"]).toContain(recoveryIssue?.status);
+  });
+
+  it("reuses the raced recovery issue instead of throwing when concurrent monitor recoveries race on the same source issue (PPC-3308)", async () => {
+    const { issueId, companyId } = await seedFixture({
+      monitor: {
+        timeoutAt: "2026-04-11T12:00:00.000Z",
+        recoveryPolicy: "create_recovery_issue",
+      },
+    });
+    const heartbeat = heartbeatService(db);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+
+    const claimed = {
+      id: issue.id,
+      companyId: issue.companyId,
+      projectId: issue.projectId,
+      goalId: issue.goalId,
+      identifier: issue.identifier,
+      title: issue.title,
+      status: issue.status,
+      priority: issue.priority,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
+      billingCode: issue.billingCode,
+      executionPolicy: issue.executionPolicy,
+      executionState: issue.executionState,
+      monitorNextCheckAt: issue.monitorNextCheckAt,
+      monitorWakeRequestedAt: issue.monitorWakeRequestedAt,
+      monitorLastTriggeredAt: issue.monitorLastTriggeredAt,
+      monitorAttemptCount: issue.monitorAttemptCount,
+      monitorNotes: issue.monitorNotes,
+      monitorScheduledBy: issue.monitorScheduledBy,
+    };
+
+    const recoveryInput = {
+      claimed,
+      scheduledAtIso: new Date("2026-04-11T12:31:00.000Z").toISOString(),
+      nextAttemptCount: 1,
+      clearReason: "timeout_exceeded" as const,
+      recoveryPolicy: "create_recovery_issue" as const,
+      monitor: null,
+      actorType: "system" as const,
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      activitySource: "scheduled" as const,
+    };
+
+    // Two (or more) dispatches racing to recover the same stuck monitor issue
+    // both do check-then-act: neither has seen the other's not-yet-committed
+    // insert when they check for an existing open recovery issue. The DB's
+    // partial unique index (companyId, originKind, originId) then makes the
+    // loser's insert throw 23505. The fix reuses the raced row instead of
+    // letting that error propagate.
+    const results = await Promise.allSettled(
+      Array.from({ length: 8 }, () => heartbeat.performIssueMonitorRecovery(recoveryInput)),
+    );
+    expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+
+    const recoveries = await db
+      .select()
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.originKind, "stranded_issue_recovery"),
+        eq(issues.originId, issueId),
+      ));
+    expect(recoveries).toHaveLength(1);
+
+    const creationActivity = await db
+      .select()
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.action, "issue.monitor_recovery_issue_created"),
+      ));
+    expect(creationActivity).toHaveLength(8);
+    const recoveryIssueIdsSeen = new Set(
+      creationActivity.map((row) => (row.details as Record<string, unknown> | null)?.recoveryIssueId),
+    );
+    expect(recoveryIssueIdsSeen.size).toBe(1);
+    expect([...recoveryIssueIdsSeen][0]).toBe(recoveries[0]?.id);
   });
 
   it("omits external monitor refs from wake payloads and activity details", async () => {

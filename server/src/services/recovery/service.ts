@@ -508,6 +508,17 @@ function unwrapDatabaseConflictError(error: unknown) {
   };
 }
 
+export function isUniqueStrandedIssueRecoveryConflict(error: unknown) {
+  const maybe = unwrapDatabaseConflictError(error);
+  if (!maybe) return false;
+  return maybe.code === "23505" &&
+    (
+      maybe.constraint === "issues_active_stranded_issue_recovery_uq" ||
+      maybe.constraint_name === "issues_active_stranded_issue_recovery_uq" ||
+      typeof maybe.message === "string" && maybe.message.includes("issues_active_stranded_issue_recovery_uq")
+    );
+}
+
 function isStrandedIssueRecoveryIssue(issue: Pick<typeof issues.$inferSelect, "originKind">) {
   return isStrandedIssueRecoveryOriginKind(issue.originKind);
 }
@@ -1815,17 +1826,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         maybe.constraint === "issues_active_stale_run_evaluation_uq" ||
         maybe.constraint_name === "issues_active_stale_run_evaluation_uq" ||
         typeof maybe.message === "string" && maybe.message.includes("issues_active_stale_run_evaluation_uq")
-      );
-  }
-
-  function isUniqueStrandedIssueRecoveryConflict(error: unknown) {
-    const maybe = unwrapDatabaseConflictError(error);
-    if (!maybe) return false;
-    return maybe.code === "23505" &&
-      (
-        maybe.constraint === "issues_active_stranded_issue_recovery_uq" ||
-        maybe.constraint_name === "issues_active_stranded_issue_recovery_uq" ||
-        typeof maybe.message === "string" && maybe.message.includes("issues_active_stranded_issue_recovery_uq")
       );
   }
 
