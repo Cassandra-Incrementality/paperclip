@@ -24,6 +24,7 @@ export default defineConfig(({ mode }) => ({
   },
   server: {
     port: 5173,
+    allowedHosts: ["paperclip.cassandragroup.cc", "localhost", "127.0.0.1"],
     watch: createUiDevWatchOptions(process.cwd()),
     proxy: {
       "/api": {

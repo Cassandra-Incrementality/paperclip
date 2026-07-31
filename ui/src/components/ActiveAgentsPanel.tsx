@@ -63,6 +63,7 @@ interface ActiveAgentsPanelProps {
   emptyMessage?: string;
   queryScope?: string;
   showMoreLink?: boolean;
+  filterStatuses?: "active" | "finished" | "all";
 }
 
 export function ActiveAgentsPanel({
@@ -76,6 +77,7 @@ export function ActiveAgentsPanel({
   emptyMessage = "No recent agent runs.",
   queryScope = "dashboard",
   showMoreLink = true,
+  filterStatuses = "all",
 }: ActiveAgentsPanelProps) {
   const liveRunsQueryKey = [...queryKeys.liveRuns(companyId), queryScope, { minRunCount, fetchLimit }] as const;
   const sharedLiveRuns = useSharedPollingQuery({
@@ -92,7 +94,12 @@ export function ActiveAgentsPanel({
   });
   usePublishSharedQueryData(sharedLiveRuns, liveRuns, liveRunsUpdatedAt);
 
-  const runs = liveRuns ?? [];
+  const runs = useMemo(() => {
+    const all = liveRuns ?? [];
+    if (filterStatuses === "active") return all.filter(isRunActive);
+    if (filterStatuses === "finished") return all.filter((r) => !isRunActive(r));
+    return all;
+  }, [liveRuns, filterStatuses]);
   const visibleRuns = useMemo(() => runs.slice(0, cardLimit), [cardLimit, runs]);
   const hiddenRunCount = Math.max(0, runs.length - visibleRuns.length);
   const visibleIssueIds = useMemo(

@@ -684,6 +684,171 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     }
   }, 40_000);
 
+  it("caps a burst of simultaneous assignment wakes at maxConcurrentRuns instead of running them all at once (PPC-2416..2422 regression)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const CAP = 3;
+    const BURST_SIZE = 7;
+    const issueIds = Array.from({ length: BURST_SIZE }, () => randomUUID());
+
+    let concurrent = 0;
+    let peakConcurrent = 0;
+    let myCallCount = 0;
+    const pendingResolvers: Array<() => void> = [];
+    const issueIdSet = new Set(issueIds);
+
+    mockAdapterExecute.mockImplementation(async (params: { context?: Record<string, unknown> }) => {
+      const issueId = typeof params?.context?.issueId === "string" ? params.context.issueId : null;
+      const isMine = issueId !== null && issueIdSet.has(issueId);
+      if (!isMine) {
+        // A previous test in this shared-mock file can still have background
+        // continuation work in flight when this test starts (visible as "failed to
+        // refresh issue continuation summary" warnings for other agent ids). Resolve
+        // those immediately so they can't pollute this test's concurrency counters.
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Unrelated stray run from another test.",
+          provider: "test",
+          model: "test-model",
+        };
+      }
+      myCallCount += 1;
+      concurrent += 1;
+      peakConcurrent = Math.max(peakConcurrent, concurrent);
+      await new Promise<void>((resolve) => {
+        pendingResolvers.push(() => {
+          concurrent -= 1;
+          resolve();
+        });
+      });
+      // Mark the issue done so the platform's own continuation logic (re-queueing a
+      // follow-up run for issues left in_progress) doesn't add extra runs on top of
+      // the 7 under test — that behavior is real but orthogonal to this regression.
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId!));
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Burst assignment run completed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "BurstCTO",
+      role: "cto",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: CAP,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(issues).values(
+      issueIds.map((issueId, index) => ({
+        id: issueId,
+        companyId,
+        title: `Quick win ${index + 1}`,
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+      })),
+    );
+
+    // Reproduce the 2026-07-10 incident: 7 issues assigned to the same agent within
+    // a ~4-second window (PPC-2416..2422, routed from card PPC-2348). All 7 wakeups
+    // land essentially at once, the way concurrent comment-mutation webhooks did in prod.
+    const wakes = await Promise.all(
+      issueIds.map((issueId) =>
+        heartbeat.wakeup(agentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: { issueId },
+          contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        }),
+      ),
+    );
+    expect(wakes.every((wake) => wake !== null)).toBe(true);
+
+    const capReached = await waitForCondition(async () => myCallCount === CAP, 10_000);
+    expect(capReached).toBe(true);
+
+    // Give the dispatcher a beat to misbehave (start more than CAP) before asserting it didn't.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(myCallCount).toBe(CAP);
+
+    const statusCounts = async () =>
+      db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId))
+        .then((rows) => {
+          const counts: Record<string, number> = {};
+          for (const row of rows) counts[row.status] = (counts[row.status] ?? 0) + 1;
+          return counts;
+        });
+
+    expect((await statusCounts()).running).toBe(CAP);
+    expect((await statusCounts()).queued).toBe(BURST_SIZE - CAP);
+
+    // Drain everything currently in-flight, in rounds, until nothing new gets queued
+    // (bounded — this also tolerates the platform queueing incidental follow-up runs,
+    // which is real behavior but not what this regression test is checking).
+    for (let round = 0; round < 30; round += 1) {
+      const batch = pendingResolvers.splice(0, pendingResolvers.length);
+      if (batch.length > 0) {
+        batch.forEach((resolve) => resolve());
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        continue;
+      }
+      const stillActive = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId))
+        .then((rows) => rows.some((row) => row.status === "queued" || row.status === "running"));
+      if (!stillActive) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    const finalRuns = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+
+    for (const issueId of issueIds) {
+      const succeededForIssue = finalRuns.some(
+        (run) => (run.contextSnapshot as { issueId?: string } | null)?.issueId === issueId && run.status === "succeeded",
+      );
+      expect(succeededForIssue).toBe(true);
+    }
+
+    // The core regression check: no issue was dropped, but the agent never ran more
+    // than CAP claude_local child processes at once — unlike the July 10 incident,
+    // where all 7 ran concurrently (default cap was 20).
+    expect(myCallCount).toBeGreaterThanOrEqual(BURST_SIZE);
+    expect(peakConcurrent).toBeLessThanOrEqual(CAP);
+    expect(peakConcurrent).toBe(CAP);
+  }, 40_000);
+
   it("cancels stale queued runs when issue blockers are still unresolved", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

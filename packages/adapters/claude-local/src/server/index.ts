@@ -12,9 +12,11 @@ export {
   parseClaudeStreamJson,
   describeClaudeFailure,
   isClaudeMaxTurnsResult,
+  isClaudePromptTooLongError,
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
   isClaudeUnknownSessionError,
+  extractClaudeRetryNotBefore,
 } from "./parse.js";
 export {
   getQuotaWindows,

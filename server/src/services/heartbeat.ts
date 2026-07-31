@@ -8343,6 +8343,82 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows.length);
   }
 
+  /**
+   * Detect errors that indicate the session context is irrecoverably bloated
+   * and must be cleared to allow future runs to succeed.
+   */
+  function isSessionContextOverflowError(errorMessage: string | null | undefined): boolean {
+    if (!errorMessage) return false;
+    const patterns = [
+      "Prompt is too long",
+      "prompt is too long",
+      "context length exceeded",
+      "maximum context length",
+      "token limit exceeded",
+    ];
+    return patterns.some((p) => errorMessage.includes(p));
+  }
+
+  /**
+   * After a run fails due to a context-overflow error, enqueue a fresh-session
+   * wakeup so the agent resumes work immediately instead of being blocked
+   * until the next scheduled heartbeat. Carries the original issueId/taskKey
+   * and is guarded against infinite loops via the parent context marker.
+   */
+  async function enqueueOverflowRecoveryWakeup(input: {
+    agent: typeof agents.$inferSelect;
+    failedRunId: string;
+    parentContext: Record<string, unknown> | null | undefined;
+    issueId: string | null;
+    taskKey: string | null;
+  }): Promise<void> {
+    const { agent, failedRunId, parentContext, issueId, taskKey } = input;
+
+    if (parentContext && parentContext.autoRecoveryFrom === "context_overflow") {
+      logger.warn(
+        { agentId: agent.id, failedRunId, taskKey },
+        "context overflow recurred on a recovery retry — not re-enqueueing, manual review required",
+      );
+      return;
+    }
+
+    if (agent.pauseReason !== null) {
+      logger.info(
+        { agentId: agent.id, failedRunId, taskKey, pauseReason: agent.pauseReason },
+        "skipping context-overflow recovery wakeup — agent is paused",
+      );
+      return;
+    }
+
+    const recoveryContext: Record<string, unknown> = {
+      forceFreshSession: true,
+      autoRecoveryFrom: "context_overflow",
+      autoRecoveryFromRunId: failedRunId,
+    };
+    if (issueId) recoveryContext.issueId = issueId;
+    if (taskKey) recoveryContext.taskKey = taskKey;
+
+    try {
+      await enqueueWakeup(agent.id, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "context_overflow_auto_recovery",
+        contextSnapshot: recoveryContext,
+        idempotencyKey: `overflow-recovery:${failedRunId}`,
+        requestedByActorType: "system",
+      });
+      logger.info(
+        { agentId: agent.id, failedRunId, taskKey, issueId },
+        "enqueued fresh-session wakeup to recover from context overflow",
+      );
+    } catch (err) {
+      logger.warn(
+        { err, agentId: agent.id, failedRunId, taskKey },
+        "failed to enqueue context-overflow recovery wakeup — agent will resume on next scheduled heartbeat",
+      );
+    }
+  }
+
   async function ensureRuntimeState(agent: typeof agents.$inferSelect) {
     const existing = await getRuntimeState(agent.id);
     if (existing) return existing;
@@ -15608,7 +15684,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           };
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
-        const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
+        const deferredWakeReason =
+          readNonEmptyString(deferred.reason) ??
+          readNonEmptyString(deferredContextSeed.wakeReason) ??
+          "";
         // Local-CLI agents post comments under user auth, so a self-comment from
         // the run that is now ending would otherwise look like a real human
         // comment and trigger a reopen on the very issue this run just closed.
@@ -15681,6 +15760,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             };
           }
+        }
+
+        // Guard: Drop non-interaction deferred wakes for terminal-state issues.
+        // Comment wakes have their own reopen path (shouldReopenDeferredCommentWake above).
+        const isDeferredInteractionWake = ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS.has(deferredWakeReason);
+        if (!shouldReopenDeferredCommentWake && !isDeferredInteractionWake &&
+            (issue.status === "done" || issue.status === "cancelled")) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "failed",
+              finishedAt: new Date(),
+              error: "Deferred wake dropped: issue is in terminal state",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          logger.info(
+            { deferredWakeId: deferred.id, issueId: issue.id, issueStatus: issue.status, deferredAgentId: deferred.agentId },
+            "dropped deferred wake — issue is in terminal state",
+          );
+          continue;
+        }
+
+        // Guard: Drop deferred wakes where the target agent is not the issue's assignee,
+        // unless it's an interaction (comment/mention) or execution-policy wake (review/approval).
+        const isDeferredExemptFromAssigneeCheck =
+          isDeferredInteractionWake || deferredWakeReason.startsWith("execution_");
+        if (!isDeferredExemptFromAssigneeCheck &&
+            issue.assigneeAgentId && issue.assigneeAgentId !== deferred.agentId) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "failed",
+              finishedAt: new Date(),
+              error: "Deferred wake dropped: agent is not the issue assignee",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          logger.info(
+            { deferredWakeId: deferred.id, issueId: issue.id, assigneeAgentId: issue.assigneeAgentId, deferredAgentId: deferred.agentId },
+            "dropped deferred wake — agent is not the issue assignee",
+          );
+          continue;
         }
 
         const promotedReason = readNonEmptyString(deferred.reason) ?? "issue_execution_promoted";
@@ -16384,6 +16506,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await markTimerHeartbeatChecked(agentId, source);
       return null;
     }
+    // Cost routing (Fase 0): a generic timer wake with no issue/comment/task attached is
+    // just "is there anything to do" triage, never a strategic decision. Force it onto the
+    // adapter's cheap model profile regardless of the agent's normally-assigned model, unless
+    // something upstream already requested a specific profile.
+    if (genericTimerWake && !readNonEmptyString(enrichedContextSnapshot.modelProfile)) {
+      enrichedContextSnapshot.modelProfile = "cheap";
+    }
 
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(agent.companyId, issueId);
@@ -16480,6 +16609,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "skipped" as const };
         }
 
+        // Guard: skip wakes for terminal-state issues (done/cancelled).
+        // Interaction wakes (comments, mentions, reopen-via-comment) are exempt because
+        // they carry their own reopen path in the deferred promotion loop.
+        const wakeReasonForGuard =
+          readNonEmptyString(enrichedContextSnapshot.wakeReason) ?? reason ?? "";
+        const isInteractionWakeForGuard = ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS.has(wakeReasonForGuard);
+        if (!isInteractionWakeForGuard && (issue.status === "done" || issue.status === "cancelled")) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "issue_terminal_state",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          logger.info(
+            { agentId, issueId, issueStatus: issue.status, wakeReason: wakeReasonForGuard },
+            "skipping issue wake — issue is in terminal state",
+          );
+          return { kind: "skipped" as const };
+        }
+
         if (worktreeExecutionCutoff && issue.createdAt < worktreeExecutionCutoff) {
           await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,
@@ -16501,6 +16657,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             idempotencyKey: opts.idempotencyKey ?? null,
             finishedAt: new Date(),
           });
+          return { kind: "skipped" as const };
+        }
+
+        // Guard: skip wakes where the agent is not the issue's assignee.
+        // Interaction wakes (comment/mention) and execution-policy wakes (review/approval)
+        // are exempt because they legitimately target non-assignee agents.
+        const isAssigneeExemptWake =
+          isInteractionWakeForGuard || wakeReasonForGuard.startsWith("execution_");
+        if (!isAssigneeExemptWake && issue.assigneeAgentId && issue.assigneeAgentId !== agentId) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "issue_non_assignee_wake",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          logger.info(
+            { agentId, issueId, assigneeAgentId: issue.assigneeAgentId, wakeReason: wakeReasonForGuard },
+            "skipping issue wake — agent is not the issue assignee",
+          );
           return { kind: "skipped" as const };
         }
 
@@ -18011,7 +18193,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       for (const agent of allAgents) {
         const invokability = evaluateAgentInvokability(toAgentOrgRow(agent), agentsByCompany.get(agent.companyId) ?? []);
-        if (!invokability.invokable) continue;
+        if (!invokability.invokable || agent.pauseReason !== null) continue;
         const policy = parseHeartbeatPolicy(agent);
         if (!policy.enabled || policy.intervalSec <= 0) continue;
 

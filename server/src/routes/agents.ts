@@ -123,10 +123,15 @@ function readRunLogLimitBytes(value: unknown) {
   return Math.max(1, Math.min(RUN_LOG_MAX_LIMIT_BYTES, Math.trunc(parsed)));
 }
 
-function readLiveRunsQueryInt(value: unknown, max: number, fallback = 0) {
+function readLiveRunsQueryInt(
+  value: unknown,
+  max: number,
+  fallback = 0,
+  options: { allowZero?: boolean } = {},
+) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
-  if (parsed <= 0) return fallback;
+  if (options.allowZero ? parsed < 0 : parsed <= 0) return fallback;
   return Math.min(max, Math.trunc(parsed));
 }
 

@@ -202,14 +202,14 @@ describe("isCodexTransientUpstreamError", () => {
     ).toBe(true);
   });
 
-  it("classifies usage-limit windows as provider quota and extracts the retry time", () => {
+  it("classifies usage-limit windows as provider quota and extracts the retry time (UTC fallback when no timezone hint is given, PPC-3260)", () => {
     const errorMessage = "You've hit your usage limit for GPT-5.3-Codex-Spark. Switch to another model now, or try again at 11:31 PM.";
-    const now = new Date(2026, 3, 22, 22, 29, 2);
+    const now = new Date("2026-04-22T20:29:02.000Z");
 
     expect(isCodexProviderQuotaError({ errorMessage })).toBe(true);
     expect(isCodexTransientUpstreamError({ errorMessage })).toBe(false);
-    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(
-      new Date(2026, 3, 22, 23, 31, 0, 0).getTime(),
+    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.toISOString()).toBe(
+      "2026-04-22T23:31:00.000Z",
     );
   });
 

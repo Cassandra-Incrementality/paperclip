@@ -1617,6 +1617,108 @@ describe("shared ACPX engine runtime behavior", () => {
   });
 });
 
+describe("ACPX provider-quota classification (PPC-3260)", () => {
+  it("classifies a failed terminal turn with the verbatim 2026-07-29 quota message as provider_quota", async () => {
+    const execute = createAcpxEngineExecutor({
+      now: () => new Date("2026-07-29T08:00:00.000Z").getTime(),
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {})(),
+          result: Promise.resolve({
+            status: "failed",
+            error: new Error("Internal error: You've hit your weekly limit · resets Jul 30 at 12pm (Europe/Rome)."),
+          }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-quota-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: await makeTempRoot() },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.errorCode).toBe("acpx_turn_failed");
+    expect(result.errorFamily).toBe("provider_quota");
+    // 2026-07-30 12:00 Europe/Rome is CEST (UTC+2) => 10:00 UTC.
+    expect(result.retryNotBefore).toBe("2026-07-30T10:00:00.000Z");
+  });
+
+  it("does not misclassify a non-quota terminal failure", async () => {
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {})(),
+          result: Promise.resolve({ status: "failed", error: new Error("boom") }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-nonquota-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: await makeTempRoot() },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.errorCode).toBe("acpx_turn_failed");
+    expect(result.errorFamily).toBeNull();
+    expect(result.retryNotBefore).toBeNull();
+  });
+
+  it("classifies a thrown ensureSession error with quota wording as provider_quota (classifyError path)", async () => {
+    const execute = createAcpxEngineExecutor({
+      now: () => new Date("2026-07-15T20:00:00.000Z").getTime(),
+      createRuntime: () => ({
+        ensureSession: async () => {
+          throw new Error("You've hit your usage limit for GPT-5. Try again at 4:30 PM (America/Chicago).");
+        },
+        startTurn: () => ({
+          events: (async function* () {})(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-quota-2",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: await makeTempRoot() },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.errorCode).toBe("provider_quota");
+    expect(result.errorFamily).toBe("provider_quota");
+    expect(result.retryNotBefore).toBe("2026-07-15T21:30:00.000Z");
+  });
+});
+
 describe("findAncestorBin", () => {
   async function writeFakeBin(dir: string, name: string) {
     const binDir = path.join(dir, "node_modules", ".bin");

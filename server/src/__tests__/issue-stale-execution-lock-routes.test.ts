@@ -343,6 +343,218 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(res.body?.error).toBe("Issue run ownership conflict");
   });
 
+  it("allows checkout adoption when stale run is non-terminal but TTL-expired", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const staleRunId = randomUUID();
+    const currentRunId = randomUUID();
+    const stalePastDate = new Date(Date.now() - 15 * 60 * 1000); // 15 minutes ago
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: staleRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: stalePastDate,
+        updatedAt: stalePastDate,
+      },
+      {
+        id: currentRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: new Date(),
+      },
+    ]);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "TTL stale lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: staleRunId,
+      executionRunId: staleRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: stalePastDate,
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId, expectedStatuses: ["in_progress"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: currentRunId, executionRunId: currentRunId });
+  });
+
+  it("does NOT treat a non-terminal run as stale before the TTL expires", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const liveRunId = randomUUID();
+    const currentRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: liveRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: new Date(),
+        // updatedAt defaults to now — within TTL
+      },
+      {
+        id: currentRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: new Date(),
+      },
+    ]);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Live lock conflict",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: liveRunId,
+      executionRunId: liveRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId, expectedStatuses: ["in_progress"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+  });
+
+  it("clears both checkoutRunId and executionRunId when TTL-expired run holds both locks", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const staleRunId = randomUUID();
+    const currentRunId = randomUUID();
+    const stalePastDate = new Date(Date.now() - 15 * 60 * 1000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: staleRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: stalePastDate,
+        updatedAt: stalePastDate,
+      },
+      {
+        id: currentRunId,
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "manual",
+        startedAt: new Date(),
+      },
+    ]);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Both locks held by stale run",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: staleRunId,
+      executionRunId: staleRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: stalePastDate,
+    });
+
+    // PATCH triggers clearExecutionRunIfTerminal and adoption
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Lock recovered" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const row = await db
+      .select({
+        title: issues.title,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row?.title).toBe("Lock recovered");
+    expect(row?.checkoutRunId).toBe(currentRunId);
+    expect(row?.executionRunId).toBe(currentRunId);
+    expect(row?.executionLockedAt).not.toBeNull();
+  });
+
   it("preserves live checkout ownership on checkout conflicts without retry side effects", async () => {
     const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
     const contenderRunId = randomUUID();

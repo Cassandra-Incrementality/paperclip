@@ -60,6 +60,7 @@ import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "./routes/tool-gateway.js";
 import { adapterRoutes } from "./routes/adapters.js";
+import { knowledgeRoutes } from "./routes/knowledge.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -400,6 +401,7 @@ export async function createApp(
     ?? null;
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(activityRoutes(db));
+  api.use(knowledgeRoutes(db));
   api.use(dashboardRoutes(db));
   api.use(attentionRoutes(db));
   api.use(decisionTrainingRoutes(db));

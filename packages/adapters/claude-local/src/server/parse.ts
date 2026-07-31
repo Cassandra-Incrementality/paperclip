@@ -1,5 +1,7 @@
 import type { UsageSummary } from "@paperclipai/adapter-utils";
+import { parseProviderQuotaResetTime } from "@paperclipai/adapter-utils";
 import {
+  asBoolean,
   asString,
   asNumber,
   parseObject,
@@ -289,6 +291,31 @@ export function isClaudeImageProcessingError(parsed: Record<string, unknown>): b
   );
 }
 
+// "Prompt is too long" is returned by the Anthropic API when a resumed session's
+// cached context exceeds the model prompt window. It surfaces as `is_error: true`
+// with `error: "invalid_request"` and `terminal_reason: "blocking_limit"`. Resuming
+// the same session will fail identically forever, so it must be treated like
+// unknown-session: drop the cached sessionId and retry fresh.
+export function isClaudePromptTooLongError(parsed: Record<string, unknown> | null | undefined): boolean {
+  if (!parsed) return false;
+
+  const terminalReason = asString(parsed.terminal_reason, "").trim().toLowerCase();
+  const resultText = asString(parsed.result, "").trim();
+  const errorField = asString((parsed as Record<string, unknown>).error, "").trim().toLowerCase();
+  const allMessages = [resultText, ...extractClaudeErrorMessages(parsed)]
+    .map((msg) => msg.trim())
+    .filter(Boolean);
+
+  const hasPromptTooLong = allMessages.some((msg) => /prompt is too long/i.test(msg));
+  if (!hasPromptTooLong) return false;
+
+  // Be conservative: only fire when the API actually rejected the request.
+  // `is_error: true` plus either an invalid_request error tag or the
+  // blocking-limit terminal reason is what the Claude CLI emits for this case.
+  const isError = asBoolean(parsed.is_error, false);
+  return isError && (errorField === "invalid_request" || terminalReason === "blocking_limit" || allMessages.length > 0);
+}
+
 function buildClaudeTransientHaystack(input: {
   parsed?: Record<string, unknown> | null;
   stdout?: string | null;
@@ -312,139 +339,6 @@ function buildClaudeTransientHaystack(input: {
     .join("\n");
 }
 
-function readTimeZoneParts(date: Date, timeZone: string) {
-  const values = new Map(
-    new Intl.DateTimeFormat("en-US", {
-      timeZone,
-      hourCycle: "h23",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    }).formatToParts(date).map((part) => [part.type, part.value]),
-  );
-  return {
-    year: Number.parseInt(values.get("year") ?? "", 10),
-    month: Number.parseInt(values.get("month") ?? "", 10),
-    day: Number.parseInt(values.get("day") ?? "", 10),
-    hour: Number.parseInt(values.get("hour") ?? "", 10),
-    minute: Number.parseInt(values.get("minute") ?? "", 10),
-  };
-}
-
-function normalizeResetTimeZone(timeZoneHint: string | null | undefined): string | null {
-  const normalized = timeZoneHint?.trim();
-  if (!normalized) return null;
-  if (/^(?:utc|gmt)$/i.test(normalized)) return "UTC";
-
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: normalized }).format(new Date(0));
-    return normalized;
-  } catch {
-    return null;
-  }
-}
-
-function dateFromTimeZoneWallClock(input: {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  timeZone: string;
-}): Date | null {
-  let candidate = new Date(Date.UTC(input.year, input.month - 1, input.day, input.hour, input.minute, 0, 0));
-  const targetUtc = Date.UTC(input.year, input.month - 1, input.day, input.hour, input.minute, 0, 0);
-
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const actual = readTimeZoneParts(candidate, input.timeZone);
-    const actualUtc = Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute, 0, 0);
-    const offsetMs = targetUtc - actualUtc;
-    if (offsetMs === 0) break;
-    candidate = new Date(candidate.getTime() + offsetMs);
-  }
-
-  const verified = readTimeZoneParts(candidate, input.timeZone);
-  if (
-    verified.year !== input.year ||
-    verified.month !== input.month ||
-    verified.day !== input.day ||
-    verified.hour !== input.hour ||
-    verified.minute !== input.minute
-  ) {
-    return null;
-  }
-
-  return candidate;
-}
-
-function nextClockTimeInTimeZone(input: {
-  now: Date;
-  hour: number;
-  minute: number;
-  timeZoneHint: string;
-}): Date | null {
-  const timeZone = normalizeResetTimeZone(input.timeZoneHint);
-  if (!timeZone) return null;
-
-  const nowParts = readTimeZoneParts(input.now, timeZone);
-  let retryAt = dateFromTimeZoneWallClock({
-    year: nowParts.year,
-    month: nowParts.month,
-    day: nowParts.day,
-    hour: input.hour,
-    minute: input.minute,
-    timeZone,
-  });
-  if (!retryAt) return null;
-
-  if (retryAt.getTime() <= input.now.getTime()) {
-    const nextDay = new Date(Date.UTC(nowParts.year, nowParts.month - 1, nowParts.day + 1, 0, 0, 0, 0));
-    retryAt = dateFromTimeZoneWallClock({
-      year: nextDay.getUTCFullYear(),
-      month: nextDay.getUTCMonth() + 1,
-      day: nextDay.getUTCDate(),
-      hour: input.hour,
-      minute: input.minute,
-      timeZone,
-    });
-  }
-
-  return retryAt;
-}
-
-function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: string | null): Date | null {
-  const normalized = clockText.trim().replace(/\s+/g, " ");
-  const match = normalized.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?/i);
-  if (!match) return null;
-
-  const hour12 = Number.parseInt(match[1] ?? "", 10);
-  const minute = Number.parseInt(match[2] ?? "0", 10);
-  if (!Number.isInteger(hour12) || hour12 < 1 || hour12 > 12) return null;
-  if (!Number.isInteger(minute) || minute < 0 || minute > 59) return null;
-
-  let hour24 = hour12 % 12;
-  if ((match[3] ?? "").toLowerCase() === "p") hour24 += 12;
-
-  if (timeZoneHint) {
-    const explicitRetryAt = nextClockTimeInTimeZone({
-      now,
-      hour: hour24,
-      minute,
-      timeZoneHint,
-    });
-    if (explicitRetryAt) return explicitRetryAt;
-  }
-
-  const retryAt = new Date(now);
-  retryAt.setHours(hour24, minute, 0, 0);
-  if (retryAt.getTime() <= now.getTime()) {
-    retryAt.setDate(retryAt.getDate() + 1);
-  }
-  return retryAt;
-}
-
 export function extractClaudeRetryNotBefore(
   input: {
     parsed?: Record<string, unknown> | null;
@@ -457,7 +351,12 @@ export function extractClaudeRetryNotBefore(
   const haystack = buildClaudeTransientHaystack(input);
   const match = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
   if (!match) return null;
-  return parseClaudeResetClockTime(match[1] ?? "", now, match[2]);
+  const clockText = (match[1] ?? "").trim();
+  const timeZoneHint = match[2]?.trim();
+  // Delegate the actual reset-clock math to the shared adapter-utils parser
+  // (see packages/adapter-utils/src/provider-quota.ts) -- this file only owns
+  // detecting Claude's own quota-message wording via CLAUDE_EXTRA_USAGE_RESET_RE.
+  return parseProviderQuotaResetTime(`resets ${clockText}${timeZoneHint ? ` (${timeZoneHint})` : ""}`, now);
 }
 
 export function isClaudeTransientUpstreamError(input: {
@@ -468,7 +367,14 @@ export function isClaudeTransientUpstreamError(input: {
 }): boolean {
   const parsed = input.parsed ?? null;
   // Deterministic failures are handled by their own classifiers.
-  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
+  if (
+    parsed &&
+    (isClaudeMaxTurnsResult(parsed) ||
+      isClaudeUnknownSessionError(parsed) ||
+      isClaudePromptTooLongError(parsed) ||
+      isClaudePoisonedPreviousMessageIdError(parsed) ||
+      isClaudeImageProcessingError(parsed))
+  ) {
     return false;
   }
   const loginMeta = detectClaudeLoginRequired({

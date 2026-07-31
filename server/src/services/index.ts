@@ -157,3 +157,4 @@ export {
 } from "./codex-auth-reconciliation.js";
 export { reconcilePersistedRuntimeServicesOnStartup, restartDesiredRuntimeServicesOnStartup } from "./workspace-runtime.js";
 export { createStorageServiceFromConfig, getStorageService } from "../storage/index.js";
+export { knowledgeService, type KnowledgeService, type WikiDocument, type SearchHit, type UpsertWikiDocumentInput } from "./knowledge.js";

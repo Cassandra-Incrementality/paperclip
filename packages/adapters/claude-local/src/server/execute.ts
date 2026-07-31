@@ -62,6 +62,7 @@ import {
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
   isClaudeMaxTurnsResult,
+  isClaudePromptTooLongError,
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
   isClaudeTransientUpstreamError,
@@ -1205,11 +1206,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     const initial = await runAttempt(sessionId ?? null);
-    const sessionErrorKind =
-      sessionId &&
+    const promptTooLong =
+      sessionId != null &&
       !initial.proc.timedOut &&
-      (initial.proc.exitCode ?? 0) !== 0 &&
-      initial.parsed
+      initial.parsed != null &&
+      isClaudePromptTooLongError(initial.parsed);
+    const sessionErrorKind = promptTooLong
+      ? "overflow"
+      : sessionId &&
+        !initial.proc.timedOut &&
+        (initial.proc.exitCode ?? 0) !== 0 &&
+        initial.parsed
         ? isClaudeUnknownSessionError(initial.parsed)
           ? "unknown"
           : isClaudePoisonedPreviousMessageIdError(initial.parsed)
@@ -1225,6 +1232,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ? "returned a poisoned message-id"
           : sessionErrorKind === "image"
           ? "contains an unprocessable image"
+          : sessionErrorKind === "overflow"
+          ? "exceeded the prompt window (Prompt is too long)"
           : "is unavailable";
       await onLog(
         "stdout",
