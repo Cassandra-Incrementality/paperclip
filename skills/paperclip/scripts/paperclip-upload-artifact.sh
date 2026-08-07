@@ -15,6 +15,10 @@ Required environment for live uploads:
 
 Options:
   --issue-id ID          Issue id to attach to (default: PAPERCLIP_TASK_ID)
+  --issue-comment-id ID  Bind the attachment to a comment you authored on
+                         --issue-id. Required when uploading to an ancestor
+                         issue you are not assigned to: post the comment
+                         first, then pass its id here (see PPC-3598).
   --company-id ID        Company id (default: PAPERCLIP_COMPANY_ID)
   --title TEXT           Work product title (default: file basename)
   --summary TEXT         Work product summary
@@ -34,6 +38,12 @@ Examples:
   scripts/paperclip-upload-artifact.sh out/walkthrough.webm \
     --title "Walkthrough video" \
     --content-type video/webm
+
+  # Uploading to an ancestor issue you are not assigned to: comment first,
+  # then bind the attachment to that comment's id.
+  scripts/paperclip-upload-artifact.sh evidence.png \
+    --issue-id "$PARENT_ISSUE_ID" \
+    --issue-comment-id "$COMMENT_ID"
 EOF
 }
 
@@ -125,6 +135,7 @@ upload_file() {
   local url="$1"
   local path="$2"
   local content_type="$3"
+  local issue_comment_id="${4:-}"
   local escaped_path
   local response_file
   local status_code
@@ -132,13 +143,24 @@ upload_file() {
   escaped_path="${path//\\/\\\\}"
   escaped_path="${escaped_path//\"/\\\"}"
   response_file="$(mktemp)"
-  status_code="$(
-    curl -sS -X POST -w '%{http_code}' -o "$response_file" \
-      "$url" \
-      -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
-      -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
-      -F "file=@\"${escaped_path}\";type=${content_type}"
-  )"
+  if [[ -n "$issue_comment_id" ]]; then
+    status_code="$(
+      curl -sS -X POST -w '%{http_code}' -o "$response_file" \
+        "$url" \
+        -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+        -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
+        -F "file=@\"${escaped_path}\";type=${content_type}" \
+        -F "issueCommentId=${issue_comment_id}"
+    )"
+  else
+    status_code="$(
+      curl -sS -X POST -w '%{http_code}' -o "$response_file" \
+        "$url" \
+        -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+        -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
+        -F "file=@\"${escaped_path}\";type=${content_type}"
+    )"
+  fi
 
   if [[ "$status_code" -lt 200 || "$status_code" -ge 300 ]]; then
     printf 'Upload failed (%s): %s\n' "$status_code" "$url" >&2
@@ -154,6 +176,7 @@ upload_file() {
 
 file_path=""
 issue_id="${PAPERCLIP_TASK_ID:-}"
+issue_comment_id=""
 company_id="${PAPERCLIP_COMPANY_ID:-}"
 title=""
 summary=""
@@ -168,6 +191,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --issue-id)
       issue_id="${2:-}"
+      shift 2
+      ;;
+    --issue-comment-id)
+      issue_comment_id="${2:-}"
       shift 2
       ;;
     --company-id)
@@ -260,6 +287,7 @@ if [[ "$dry_run" == "1" ]]; then
   jq -n \
     --arg file "$file_path" \
     --arg issueId "$issue_id" \
+    --arg issueCommentId "$issue_comment_id" \
     --arg companyId "$company_id" \
     --arg title "$title" \
     --arg summary "$summary" \
@@ -267,7 +295,7 @@ if [[ "$dry_run" == "1" ]]; then
     --arg status "$status" \
     --argjson createWorkProduct "$create_work_product_json" \
     --argjson isPrimary "$is_primary_json" \
-    '{file: $file, issueId: $issueId, companyId: $companyId, title: $title, summary: $summary, contentType: $contentType, status: $status, createWorkProduct: $createWorkProduct, isPrimary: $isPrimary}'
+    '{file: $file, issueId: $issueId, issueCommentId: (if $issueCommentId == "" then null else $issueCommentId end), companyId: $companyId, title: $title, summary: $summary, contentType: $contentType, status: $status, createWorkProduct: $createWorkProduct, isPrimary: $isPrimary}'
   exit 0
 fi
 
@@ -286,7 +314,8 @@ attachment="$(
   upload_file \
     "$api_base/companies/$company_id/issues/$issue_id/attachments" \
     "$file_path" \
-    "$content_type"
+    "$content_type" \
+    "$issue_comment_id"
 )"
 
 work_product="null"

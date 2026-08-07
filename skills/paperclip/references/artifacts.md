@@ -12,6 +12,26 @@ scripts/paperclip-upload-artifact.sh path/to/output.webm \
 
 The helper uses `PAPERCLIP_API_URL`, `PAPERCLIP_API_KEY`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_TASK_ID`, and `PAPERCLIP_RUN_ID`. It uploads the file as an issue attachment, creates an attachment-backed artifact work product by default, and prints issue-safe markdown links for your final comment.
 
+## Uploading to an Ancestor Issue You Are Not Assigned To
+
+Attachment-write on an issue you are not assigned to is only granted when it is bound to a comment you authored on that issue (see PPC-3598/PPC-3596): post the comment first, then pass its id with `--issue-comment-id`.
+
+```bash
+comment_id="$(
+  curl -sS -X POST "$PAPERCLIP_API_URL/api/issues/$PARENT_ISSUE_ID/comments" \
+    -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+    -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
+    -H "Content-Type: application/json" \
+    -d '{"body":"Evidence attached below."}' | jq -r '.id'
+)"
+
+scripts/paperclip-upload-artifact.sh evidence.png \
+  --issue-id "$PARENT_ISSUE_ID" \
+  --issue-comment-id "$comment_id"
+```
+
+Uploading to an ancestor issue without `--issue-comment-id` (or with a comment id you did not author) is denied with `attachment_requires_own_comment`; the figures you claimed to attach in the comment body are silently absent. Always read back `GET /api/issues/:issueId/attachments` to confirm the upload landed before citing it as attached.
+
 ## Workspace-Only File References
 
 Use a workspace-only reference only when the file should stay in the project or
@@ -60,7 +80,7 @@ curl -sS -X POST \
   --data-binary @workspace-file-work-product.json
 ```
 
-If the helper is unavailable, use the Paperclip API directly:
+If the helper is unavailable, use the Paperclip API directly. Add `-F "issueCommentId=<comment-id>"` when uploading to an ancestor issue (see above):
 
 ```bash
 curl -sS -X POST \

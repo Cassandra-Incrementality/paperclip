@@ -596,7 +596,7 @@ If `plan` already exists, fetch the current document first and send its latest `
 | Search issues                         | `GET /api/companies/:companyId/issues?q=search+term`                                                                            |
 | Issue documents (list/get/put)        | `GET\|PUT /api/issues/:issueId/documents[/:key]`                                                                                |
 | Create approval                       | `POST /api/companies/:companyId/approvals`                                                                                      |
-| Upload attachment (multipart, `file`) | `POST /api/companies/:companyId/issues/:issueId/attachments`                                                                    |
+| Upload attachment (multipart, `file`, optional `issueCommentId`) | `POST /api/companies/:companyId/issues/:issueId/attachments`                                                    |
 | List / get / delete attachment        | `GET /api/issues/:issueId/attachments` • `GET\|DELETE /api/attachments/:attachmentId[/content]`                                 |
 | Execution workspace + runtime         | `GET /api/execution-workspaces/:id` • `POST …/runtime-services/:action`                                                         |
 | Set agent instructions path           | `PATCH /api/agents/:agentId/instructions-path`                                                                                  |
