@@ -3972,6 +3972,78 @@ export function issueRoutes(
     return true;
   }
 
+  /**
+   * Attachment-write gate for PPC-3598 (root cause diagnosed in PPC-3596): the
+   * `issue:comment` direct-parent-report grant (an agent assigned to child C
+   * may comment on C's parent P) never extended to `issue:mutate`, so an
+   * agent that could legitimately comment on an ancestor issue got a bare 403
+   * trying to attach evidence to that same ancestor — comments claiming
+   * "N attached" silently had nothing attached.
+   *
+   * Rule: may comment on an issue only via the narrow comment-only grants
+   * (direct-parent-report, issue-mention) ⇒ may attach to a comment on that
+   * issue that the actor itself authored. An unbound attachment (no
+   * `issueCommentId`), or one bound to someone else's comment or a different
+   * issue's comment, stays denied.
+   *
+   * The comment-bound path is only consulted when the actor is neither the
+   * issue's assignee nor uploading to an unassigned issue, AND the actor's
+   * `issue:comment` access is granted specifically via
+   * {@link isDirectParentReportDecision} or {@link isIssueMentionGrantDecision}
+   * — the two channels that grant `issue:comment` without ever granting
+   * `issue:mutate` (`authorization.ts` scopes both to `action ===
+   * "issue:comment"` only). This is deliberately narrower than "comment
+   * access allowed for any reason": a default-open (`allow_visible_issue_write`)
+   * or self-assignment comment grant already implies (or is orthogonal to)
+   * full mutate evaluation, so requiring comment-binding there would wrongly
+   * turn an unbound upload that {@link assertAgentIssueMutationAllowed} would
+   * otherwise deny with its own boundary/lock code into a misleading
+   * `attachment_requires_own_comment` 403 — or, worse, turn one it would
+   * otherwise *allow* into a spurious denial.
+   *
+   * This is what lets a comment-bound upload succeed even while the
+   * run/checkout lock is held by the real assignee (PPC-3596's original bug:
+   * comments are intentionally exempt from that lock, and evidence bound to
+   * the actor's own comment inherits the same exemption). Task-watchdog
+   * scope and an actor who owns/has no assignee are distinct, broader grant
+   * channels this fallback has no business overriding, so both skip straight
+   * through to the untouched, unmodified mutation gate: its 409
+   * checkout-lock branch and checkout-ownership adoption stay byte-for-byte
+   * the same, and it is called at most once per request (no double
+   * response).
+   */
+  async function assertAgentIssueAttachmentAllowed(
+    req: Request,
+    res: Response,
+    issue: Parameters<typeof assertAgentIssueMutationAllowed>[2],
+    issueCommentId: string | null,
+  ) {
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      const actorAgentId = req.actor.agentId;
+      const isOwnerOrUnassigned = issue.assigneeAgentId === null || issue.assigneeAgentId === actorAgentId;
+      if (!isOwnerOrUnassigned) {
+        const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
+        if (watchdogScope.kind === "none") {
+          const commentDecision = await decideIssueAccess(req, issue, "issue:comment");
+          if (
+            commentDecision.allowed &&
+            (isDirectParentReportDecision(commentDecision) || isIssueMentionGrantDecision(commentDecision))
+          ) {
+            const comment = issueCommentId ? await svc.getComment(issueCommentId) : null;
+            const boundToOwnComment =
+              comment !== null &&
+              comment.deletedAt === null &&
+              comment.issueId === issue.id &&
+              comment.authorAgentId === actorAgentId;
+            if (boundToOwnComment) return true;
+            return denyIssueWrite(req, res, issue, "attachment_requires_own_comment");
+          }
+        }
+      }
+    }
+    return assertAgentIssueMutationAllowed(req, res, issue);
+  }
+
   async function assertFreshTaskWatchdogSourceMutation(
     res: Response,
     scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
@@ -11776,9 +11848,10 @@ export function issueRoutes(
       res.status(422).json({ error: "Issue does not belong to company" });
       return;
     }
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-    if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
 
+    // Auth runs after the multipart body is parsed (below): the fallback
+    // comment-bound grant in assertAgentIssueAttachmentAllowed needs the
+    // `issueCommentId` form field, which multer has not populated yet.
     const company = await companiesSvc.getById(companyId);
     const attachmentMaxBytes = normalizeIssueAttachmentMaxBytes(company?.attachmentMaxBytes);
 
@@ -11815,6 +11888,9 @@ export function issueRoutes(
       res.status(400).json({ error: "Invalid attachment metadata", details: parsedMeta.error.issues });
       return;
     }
+
+    if (!(await assertAgentIssueAttachmentAllowed(req, res, issue, parsedMeta.data.issueCommentId ?? null))) return;
+    if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
 
     const actor = getActorInfo(req);
     const stored = await storage.putFile({

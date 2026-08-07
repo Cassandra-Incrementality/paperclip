@@ -32,6 +32,7 @@ export const ISSUE_WRITE_DENIAL_CODES = [
   "cross_issue_influence_cap_exceeded",
   "cross_issue_influence_run_context_required",
   "issue_write_attribution_spoof_rejected",
+  "attachment_requires_own_comment",
 ] as const;
 
 export type IssueWriteDenialCode = (typeof ISSUE_WRITE_DENIAL_CODES)[number];
@@ -278,6 +279,27 @@ export function describeIssueWriteDenial(
         sanctionedPath:
           `Remove \`onBehalfOfUserId\` from the request and retry; the server fills in ` +
           `${responsible} from your run.`,
+      };
+
+    case "attachment_requires_own_comment":
+      return {
+        code,
+        status: 403,
+        tone: "boundary",
+        boundary: "Attachment binding",
+        title: "Attachment must bind to your own comment",
+        description:
+          `${actor} can write to ${issue} only through a narrow comment grant, not full ` +
+          `mutation access. An attachment on a task reached that way must be bound — via ` +
+          `\`issueCommentId\` — to a comment ${actor} itself authored on ${issue}; an ` +
+          `unbound upload, or one bound to someone else's comment or a different issue's ` +
+          `comment, stays refused.`,
+        whoCanAct:
+          `${assignee}, or ${actor} once it has posted its own comment on ${issue} to bind ` +
+          `the upload to.`,
+        sanctionedPath:
+          `Post the comment first (POST /issues/{id}/comments), then upload the attachment ` +
+          `with \`issueCommentId\` set to the id that call returns.`,
       };
   }
 }

@@ -48,6 +48,26 @@ import { agentRoutes } from "../routes/agents.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { LOW_TRUST_QUARANTINED_BODY } from "../services/source-trust.js";
+import type { StorageService } from "../storage/types.js";
+
+function createTestStorageService(): StorageService {
+  return {
+    provider: "local_disk",
+    putFile: async (input) => ({
+      provider: "local_disk",
+      objectKey: `${input.namespace}/${input.originalFilename ?? "upload"}`,
+      contentType: input.contentType,
+      byteSize: input.body.length,
+      sha256: "sha256-sample",
+      originalFilename: input.originalFilename,
+    }),
+    getObject: async () => {
+      throw new Error("getObject is not supported by the test storage stub");
+    },
+    headObject: async () => ({ exists: false }),
+    deleteObject: async () => undefined,
+  };
+}
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -169,7 +189,7 @@ function createApp(db: Db, actor: Express.Request["actor"]) {
     next();
   });
   app.use("/api", agentRoutes(db));
-  app.use("/api", issueRoutes(db, {} as any));
+  app.use("/api", issueRoutes(db, createTestStorageService()));
   app.use(errorHandler);
   return app;
 }
@@ -855,6 +875,49 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
         .where(eq(issues.id, fixture.issues.reviewRoot.id));
       expect(persistedParent?.status).toBe("done");
     }
+  });
+
+  it("extends direct-parent reporting to a bound attachment, and keeps low-trust attachment-write closed (PPC-3598)", async () => {
+    const fixture = await seedLowTrustFixture(db);
+    const standardApp = createApp(db, standardReportActor(fixture));
+    const lowTrustApp = createApp(db, agentActor(fixture));
+
+    const parentComment = await request(standardApp)
+      .post(`/api/issues/${fixture.issues.reviewRoot.id}/comments`)
+      .send({ body: "Findings attached below." });
+    expect(parentComment.status, JSON.stringify(parentComment.body)).toBe(201);
+
+    const boundUpload = await request(standardApp)
+      .post(`/api/companies/${fixture.company.id}/issues/${fixture.issues.reviewRoot.id}/attachments`)
+      .field("issueCommentId", parentComment.body.id)
+      .attach("file", Buffer.from("finding"), { filename: "finding.txt", contentType: "text/plain" });
+    expect(boundUpload.status, JSON.stringify(boundUpload.body)).toBe(201);
+
+    const [attachmentRow] = await db
+      .select({ issueCommentId: issueAttachments.issueCommentId, createdByAgentId: assets.createdByAgentId })
+      .from(issueAttachments)
+      .innerJoin(assets, eq(assets.id, issueAttachments.assetId))
+      .where(eq(issueAttachments.id, boundUpload.body.id));
+    expect(attachmentRow?.issueCommentId).toBe(parentComment.body.id);
+    expect(attachmentRow?.createdByAgentId).toBe(fixture.agents.standard.id);
+
+    const unboundUpload = await request(standardApp)
+      .post(`/api/companies/${fixture.company.id}/issues/${fixture.issues.reviewRoot.id}/attachments`)
+      .attach("file", Buffer.from("finding"), { filename: "unbound.txt", contentType: "text/plain" });
+    expect(unboundUpload.status, JSON.stringify(unboundUpload.body)).toBe(403);
+    expect(unboundUpload.body.details.code).toBe("attachment_requires_own_comment");
+
+    // The direct-parent-report grant this closes never applied to the
+    // low-trust boundary (matching the standing `lowTrustParentComment`
+    // 403 above) — confirm the low-trust actor does not gain attachment
+    // write on the parent it still cannot comment on, even when it tries
+    // to piggyback on the standard actor's own comment id.
+    const lowTrustUpload = await request(lowTrustApp)
+      .post(`/api/companies/${fixture.company.id}/issues/${fixture.issues.reviewRoot.id}/attachments`)
+      .field("issueCommentId", parentComment.body.id)
+      .attach("file", Buffer.from("finding"), { filename: "sneak.txt", contentType: "text/plain" });
+    expect(lowTrustUpload.status, JSON.stringify(lowTrustUpload.body)).toBe(403);
+    expect(lowTrustUpload.body.details?.code).not.toBe("attachment_requires_own_comment");
   });
 
   it("relays blocked and cancelled stops once without laundering child prose", async () => {

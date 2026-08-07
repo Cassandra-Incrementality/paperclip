@@ -10,6 +10,7 @@ const mockIssueService = vi.hoisted(() => ({
   getByIdentifier: vi.fn(),
   createAttachment: vi.fn(),
   getAttachmentById: vi.fn(),
+  getComment: vi.fn(),
 }));
 const mockCompanyService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -154,7 +155,10 @@ function createStorageService(body = Buffer.from("test")): TestStorageService {
   };
 }
 
-async function createApp(storage: StorageService, options?: { companyIds?: string[]; source?: string }) {
+async function createApp(
+  storage: StorageService,
+  options?: { companyIds?: string[]; source?: string; actor?: Record<string, unknown> },
+) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
@@ -162,7 +166,7 @@ async function createApp(storage: StorageService, options?: { companyIds?: strin
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
+    (req as any).actor = options?.actor ?? {
       type: "board",
       userId: "local-board",
       companyIds: options?.companyIds ?? ["company-1"],
@@ -174,6 +178,16 @@ async function createApp(storage: StorageService, options?: { companyIds?: strin
   app.use("/api", issueRoutes({} as any, storage));
   app.use(errorHandler);
   return app;
+}
+
+function agentActor(agentId: string, overrides: Record<string, unknown> = {}) {
+  return {
+    type: "agent",
+    agentId,
+    companyId: "company-1",
+    source: "agent_key",
+    ...overrides,
+  };
 }
 
 function makeAttachment(contentType: string, originalFilename: string) {
@@ -782,5 +796,173 @@ describe("issue attachment routes", () => {
         },
       }),
     );
+  });
+
+  describe("attachment write bound to the actor's own comment (PPC-3598)", () => {
+    const parentIssueId = "11111111-1111-4111-8111-111111111111";
+    const actorAgentId = "44444444-4444-4444-8444-444444444444";
+    const otherAgentId = "55555555-5555-4555-8555-555555555555";
+    const commentId = "66666666-6666-4666-8666-666666666666";
+    const otherIssueId = "77777777-7777-4777-8777-777777777777";
+
+    function parentIssue() {
+      return {
+        id: parentIssueId,
+        companyId: "company-1",
+        projectId: null,
+        parentId: null,
+        status: "todo",
+        assigneeAgentId: otherAgentId,
+        assigneeUserId: null,
+        identifier: "PAP-1",
+      };
+    }
+
+    function ownComment(overrides: Record<string, unknown> = {}) {
+      return {
+        id: commentId,
+        issueId: parentIssueId,
+        companyId: "company-1",
+        authorAgentId: actorAgentId,
+        deletedAt: null,
+        body: "6 figures attached below.",
+        ...overrides,
+      };
+    }
+
+    function mockDirectParentReportGrant() {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+        if (input.action === "issue:mutate") {
+          return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "Missing permission." };
+        }
+        if (input.action === "issue:comment") {
+          return {
+            allowed: true,
+            action: input.action,
+            reason: "allow_direct_parent_report",
+            explanation: "Allowed by a direct-parent-report grant.",
+          };
+        }
+        return { allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "Allowed by test default." };
+      });
+    }
+
+    it("allows an attachment bound to the actor's own comment on an ancestor issue reached only via a comment grant", async () => {
+      const storage = createStorageService();
+      mockIssueService.getById.mockResolvedValue(parentIssue());
+      mockIssueService.getComment.mockResolvedValue(ownComment());
+      mockIssueService.createAttachment.mockResolvedValue(makeAttachment("text/plain", "figures.txt"));
+      mockDirectParentReportGrant();
+
+      const app = await createApp(storage, { actor: agentActor(actorAgentId) });
+      const res = await request(app)
+        .post(`/api/companies/company-1/issues/${parentIssueId}/attachments`)
+        .field("issueCommentId", commentId)
+        .attach("file", Buffer.from("figures"), { filename: "figures.txt", contentType: "text/plain" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.getComment).toHaveBeenCalledWith(commentId);
+      expect(mockIssueService.createAttachment).toHaveBeenCalledWith(
+        expect.objectContaining({
+          issueId: parentIssueId,
+          issueCommentId: commentId,
+          createdByAgentId: actorAgentId,
+        }),
+      );
+    });
+
+    it("denies an unbound attachment (no issueCommentId) on the ancestor issue", async () => {
+      const storage = createStorageService();
+      mockIssueService.getById.mockResolvedValue(parentIssue());
+      mockDirectParentReportGrant();
+
+      const app = await createApp(storage, { actor: agentActor(actorAgentId) });
+      const res = await request(app)
+        .post(`/api/companies/company-1/issues/${parentIssueId}/attachments`)
+        .attach("file", Buffer.from("figures"), { filename: "figures.txt", contentType: "text/plain" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.code).toBe("attachment_requires_own_comment");
+      expect(mockIssueService.createAttachment).not.toHaveBeenCalled();
+    });
+
+    it("denies binding to a comment authored by a different agent (privilege escalation)", async () => {
+      const storage = createStorageService();
+      mockIssueService.getById.mockResolvedValue(parentIssue());
+      mockIssueService.getComment.mockResolvedValue(ownComment({ authorAgentId: otherAgentId }));
+      mockDirectParentReportGrant();
+
+      const app = await createApp(storage, { actor: agentActor(actorAgentId) });
+      const res = await request(app)
+        .post(`/api/companies/company-1/issues/${parentIssueId}/attachments`)
+        .field("issueCommentId", commentId)
+        .attach("file", Buffer.from("figures"), { filename: "figures.txt", contentType: "text/plain" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.code).toBe("attachment_requires_own_comment");
+      expect(mockIssueService.createAttachment).not.toHaveBeenCalled();
+    });
+
+    it("denies binding to a comment that belongs to a different issue (cross-issue smuggling)", async () => {
+      const storage = createStorageService();
+      mockIssueService.getById.mockResolvedValue(parentIssue());
+      mockIssueService.getComment.mockResolvedValue(ownComment({ issueId: otherIssueId }));
+      mockDirectParentReportGrant();
+
+      const app = await createApp(storage, { actor: agentActor(actorAgentId) });
+      const res = await request(app)
+        .post(`/api/companies/company-1/issues/${parentIssueId}/attachments`)
+        .field("issueCommentId", commentId)
+        .attach("file", Buffer.from("figures"), { filename: "figures.txt", contentType: "text/plain" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.code).toBe("attachment_requires_own_comment");
+      expect(mockIssueService.createAttachment).not.toHaveBeenCalled();
+    });
+
+    it("denies an unrelated agent with no comment grant, unchanged", async () => {
+      const storage = createStorageService();
+      mockIssueService.getById.mockResolvedValue(parentIssue());
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: false,
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation: "Missing permission.",
+      }));
+
+      const app = await createApp(storage, { actor: agentActor(actorAgentId) });
+      const res = await request(app)
+        .post(`/api/companies/company-1/issues/${parentIssueId}/attachments`)
+        .field("issueCommentId", commentId)
+        .attach("file", Buffer.from("figures"), { filename: "figures.txt", contentType: "text/plain" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.code).not.toBe("attachment_requires_own_comment");
+      expect(mockIssueService.getComment).not.toHaveBeenCalled();
+      expect(mockIssueService.createAttachment).not.toHaveBeenCalled();
+    });
+
+    it("keeps the assignee uploading to its own issue unchanged (201)", async () => {
+      const storage = createStorageService();
+      mockIssueService.getById.mockResolvedValue({ ...parentIssue(), assigneeAgentId: actorAgentId });
+      mockIssueService.createAttachment.mockResolvedValue(makeAttachment("text/plain", "figures.txt"));
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by test default.",
+      }));
+
+      const app = await createApp(storage, { actor: agentActor(actorAgentId) });
+      const res = await request(app)
+        .post(`/api/companies/company-1/issues/${parentIssueId}/attachments`)
+        .attach("file", Buffer.from("figures"), { filename: "figures.txt", contentType: "text/plain" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.getComment).not.toHaveBeenCalled();
+      expect(mockIssueService.createAttachment).toHaveBeenCalledWith(
+        expect.objectContaining({ issueId: parentIssueId, createdByAgentId: actorAgentId }),
+      );
+    });
   });
 });
