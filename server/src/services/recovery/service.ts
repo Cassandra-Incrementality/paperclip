@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, not, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -1209,6 +1209,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function reconcileUnassignedBlockingIssues() {
+    // A human assignee only counts as a reachable owner when it is the board's
+    // live digest identity AND the status is one the digest actually surfaces
+    // (mirrors OWNED_SQL in paperclip-digest/needs_you_digest.py, status IN
+    // ('blocked','in_review')). Any other human assignee is a phantom owner:
+    // it reads as "owned" to every automated check while nobody can see it.
+    // Keep this list in sync with GABRIELE_USER_ID, fixed in PPC-3612 (that
+    // ticket found the digest was pointed at a dormant duplicate account).
+    const DIGEST_VISIBLE_BOARD_IDENTITIES: Array<{ companyId: string; userId: string }> = [
+      { companyId: "c19d22c4-0650-4862-889b-9a88be3b5668", userId: "aAhEaMbaX1EZcejtDv6DWbQMUgfEsuca" },
+    ];
+    const reachableHumanOwnerSql = DIGEST_VISIBLE_BOARD_IDENTITIES.length
+      ? or(
+        ...DIGEST_VISIBLE_BOARD_IDENTITIES.map((identity) =>
+          and(eq(issues.companyId, identity.companyId), eq(issues.assigneeUserId, identity.userId))!
+        ),
+      )!
+      : sql`false`;
+
+    // A "blocks" edge is no longer required: an ordinary leaf issue with no
+    // outbound edge is invisible to every other liveness mechanism, so it
+    // qualifies once it has sat untouched past the staleness threshold.
+    const hasLiveBlockingEdgeSql = sql<boolean>`exists (
+      select 1
+      from issue_relations ir
+      join issues blocked_issue on blocked_issue.id = ir.related_issue_id
+      where ir.issue_id = ${issues.id}
+        and ir.type = 'blocks'
+        and blocked_issue.company_id = ${issues.companyId}
+        and blocked_issue.status not in ('done', 'cancelled')
+    )`;
+
     const candidates = await db
       .select({
         id: issues.id,
@@ -1216,35 +1247,42 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         identifier: issues.identifier,
         status: issues.status,
         createdByAgentId: issues.createdByAgentId,
+        assigneeUserId: issues.assigneeUserId,
       })
-      .from(issueRelations)
-      .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+      .from(issues)
       .where(
         and(
-          eq(issueRelations.type, "blocks"),
-          inArray(issues.status, ["todo", "blocked"]),
+          visibleIssueCondition(),
+          inArray(issues.status, ["todo", "blocked", "in_review"]),
           isNull(issues.assigneeAgentId),
-          isNull(issues.assigneeUserId),
           sql`${issues.createdByAgentId} is not null`,
-          sql`exists (
-            select 1
-            from issues blocked_issue
-            where blocked_issue.id = ${issueRelations.relatedIssueId}
-              and blocked_issue.company_id = ${issues.companyId}
-              and blocked_issue.status not in ('done', 'cancelled')
-          )`,
+          or(
+            isNull(issues.assigneeUserId),
+            not(and(reachableHumanOwnerSql, inArray(issues.status, ["blocked", "in_review"]))!),
+          ),
+          or(
+            hasLiveBlockingEdgeSql,
+            sql`${issues.updatedAt} < now() - interval '24 hours'`,
+          ),
+          or(
+            sql`${issues.status} <> 'in_review'`,
+            and(
+              isNull(issues.checkoutRunId),
+              isNull(issues.executionRunId),
+              sql`not exists (
+                select 1 from issue_thread_interactions iti
+                where iti.issue_id = ${issues.id} and iti.status = 'pending'
+              )`,
+            ),
+          ),
         ),
       );
 
     let assigned = 0;
     let skipped = 0;
     const issueIds: string[] = [];
-    const seen = new Set<string>();
 
     for (const candidate of candidates) {
-      if (seen.has(candidate.id)) continue;
-      seen.add(candidate.id);
-
       const creatorAgentId = candidate.createdByAgentId;
       if (!creatorAgentId) {
         skipped += 1;
@@ -1258,6 +1296,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
       const blockingLinks = formatIssueLinksForComment(relations.blocks);
+      const hasLiveBlockingEdge = relations.blocks.some(
+        (blocked) => blocked.status !== "done" && blocked.status !== "cancelled",
+      );
+      const hadPhantomHumanOwner = Boolean(candidate.assigneeUserId);
       const updated = await issuesSvc.update(candidate.id, {
         assigneeAgentId: creatorAgent.id,
         assigneeUserId: null,
@@ -1267,15 +1309,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
+      const reasonLine = hasLiveBlockingEdge
+        ? `Paperclip found this issue is blocking ${blockingLinks} but had no reachable owner, so no heartbeat could pick it up.`
+        : "Paperclip found this issue unowned and untouched for more than 24 hours, with no reachable owner, so no heartbeat could pick it up.";
+      const phantomOwnerLine = hadPhantomHumanOwner
+        ? "It carried a human assignee Paperclip's board digest does not surface from this status, so it read as owned to every automated check while being reachable by nobody."
+        : null;
+
       await issuesSvc.addComment(
         candidate.id,
         [
           "## Assigned Orphan Blocker",
           "",
-          `Paperclip found this issue is blocking ${blockingLinks} but had no assignee, so no heartbeat could pick it up.`,
+          reasonLine,
+          ...(phantomOwnerLine ? ["", phantomOwnerLine] : []),
           "",
-          "- Assigned it back to the agent that created the blocker.",
-          "- Next action: resolve this blocker or reassign it to the right owner.",
+          "- Assigned it back to the agent that created it.",
+          "- Next action: resolve this or reassign it to the right owner.",
         ].join("\n"),
         {},
       );
@@ -1293,6 +1343,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           identifier: candidate.identifier,
           assigneeAgentId: creatorAgent.id,
           source: "recovery.reconcile_unassigned_blocking_issue",
+          hadLiveBlockingEdge: hasLiveBlockingEdge,
+          hadPhantomHumanOwner,
         },
       });
 

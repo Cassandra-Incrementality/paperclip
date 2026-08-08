@@ -5720,6 +5720,578 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("routes an in_review orphan blocker with no active run or pending interaction back to its creator", async () => {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const blockedAssigneeAgentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: creatorAgentId,
+        companyId,
+        name: "SecurityEngineer",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: blockedAssigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "In review with a stranded creator",
+        status: "in_review",
+        priority: "high",
+        createdByAgentId: creatorAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked work",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: blockedAssigneeAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+      createdByAgentId: creatorAgentId,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.orphanBlockersAssigned).toBe(1);
+    expect(result.issueIds).toContain(blockerIssueId);
+
+    const blocker = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, blockerIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(blocker?.assigneeAgentId).toBe(creatorAgentId);
+  });
+
+  it("treats a human assignee who is not the digest-visible board identity as a phantom owner and reaps it", async () => {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const blockedAssigneeAgentId = randomUUID();
+    const orphanIssueId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: creatorAgentId,
+        companyId,
+        name: "SecurityEngineer",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: blockedAssigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: orphanIssueId,
+        companyId,
+        title: "Stuck on a stale human assignment",
+        status: "blocked",
+        priority: "high",
+        assigneeUserId: randomUUID(),
+        createdByAgentId: creatorAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked work",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: blockedAssigneeAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: orphanIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+      createdByAgentId: creatorAgentId,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.orphanBlockersAssigned).toBe(1);
+    expect(result.issueIds).toContain(orphanIssueId);
+
+    const orphan = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, orphanIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(orphan?.assigneeAgentId).toBe(creatorAgentId);
+    expect(orphan?.assigneeUserId).toBeNull();
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, orphanIssueId));
+    expect(comments[0]?.body).toContain("board digest does not surface");
+  });
+
+  it("routes an ordinary leaf issue with no blocking edge once it has sat unowned for more than 24 hours", async () => {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const leafIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "SecurityEngineer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const staleUpdatedAt = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: leafIssueId,
+      companyId,
+      title: "Ordinary leaf, no outbound blocks edge",
+      status: "todo",
+      priority: "medium",
+      createdByAgentId: creatorAgentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      updatedAt: staleUpdatedAt,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.orphanBlockersAssigned).toBe(1);
+    expect(result.issueIds).toContain(leafIssueId);
+
+    const leaf = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, leafIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(leaf?.assigneeAgentId).toBe(creatorAgentId);
+  });
+
+  it("does not touch a freshly-created leaf issue with no blocking edge before the staleness threshold", async () => {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const leafIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "SecurityEngineer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: leafIssueId,
+      companyId,
+      title: "Fresh leaf, no outbound blocks edge",
+      status: "todo",
+      priority: "medium",
+      createdByAgentId: creatorAgentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.issueIds).not.toContain(leafIssueId);
+    const leaf = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, leafIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(leaf?.assigneeAgentId).toBeNull();
+  });
+
+  it("leaves a stale unowned backlog issue untouched", async () => {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const backlogIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "SecurityEngineer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: backlogIssueId,
+      companyId,
+      title: "Parked, unowned, ancient",
+      status: "backlog",
+      priority: "low",
+      createdByAgentId: creatorAgentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      updatedAt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.issueIds).not.toContain(backlogIssueId);
+    const backlog = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, backlogIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(backlog?.assigneeAgentId).toBeNull();
+    expect(backlog?.status).toBe("backlog");
+  });
+
+  it("leaves an issue owned by the digest-visible board identity untouched", async () => {
+    const companyId = "c19d22c4-0650-4862-889b-9a88be3b5668";
+    const creatorAgentId = randomUUID();
+    const blockedAssigneeAgentId = randomUUID();
+    const ownedIssueId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Cassandra",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: creatorAgentId,
+        companyId,
+        name: "SecurityEngineer",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: blockedAssigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: ownedIssueId,
+        companyId,
+        title: "Parked on the live board identity",
+        status: "blocked",
+        priority: "critical",
+        assigneeUserId: "aAhEaMbaX1EZcejtDv6DWbQMUgfEsuca",
+        createdByAgentId: creatorAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked work",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: blockedAssigneeAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: ownedIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+      createdByAgentId: creatorAgentId,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.issueIds).not.toContain(ownedIssueId);
+    const owned = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, ownedIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(owned?.assigneeUserId).toBe("aAhEaMbaX1EZcejtDv6DWbQMUgfEsuca");
+    expect(owned?.assigneeAgentId).toBeNull();
+  });
+
+  it("does not sweep an in_review issue that still has a live checkout run", async () => {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const runningAgentId = randomUUID();
+    const inReviewIssueId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const runId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: creatorAgentId,
+        companyId,
+        name: "SecurityEngineer",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: runningAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "running",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: runningAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+    });
+    await db.insert(issues).values([
+      {
+        id: inReviewIssueId,
+        companyId,
+        title: "In review, actively being executed",
+        status: "in_review",
+        priority: "high",
+        checkoutRunId: runId,
+        createdByAgentId: creatorAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked work",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: runningAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: inReviewIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+      createdByAgentId: creatorAgentId,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.issueIds).not.toContain(inReviewIssueId);
+    const inReview = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, inReviewIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(inReview?.assigneeAgentId).toBeNull();
+  });
+
+  it("does not sweep an in_review issue that has a pending thread interaction", async () => {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const inReviewIssueId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "SecurityEngineer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: inReviewIssueId,
+        companyId,
+        title: "In review, awaiting a human answer",
+        status: "in_review",
+        priority: "high",
+        createdByAgentId: creatorAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked work",
+        status: "blocked",
+        priority: "high",
+        createdByAgentId: creatorAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: inReviewIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+      createdByAgentId: creatorAgentId,
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId,
+      issueId: inReviewIssueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      createdByAgentId: creatorAgentId,
+      payload: { version: 1, questions: [] },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.issueIds).not.toContain(inReviewIssueId);
+    const inReview = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, inReviewIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(inReview?.assigneeAgentId).toBeNull();
+  });
+
   it("re-enqueues continuation for stranded in-progress work with no active run", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",

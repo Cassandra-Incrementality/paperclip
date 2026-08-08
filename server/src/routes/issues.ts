@@ -436,6 +436,18 @@ const attachmentArtifactMetadataInputSchema = z.object({
   attachmentId: z.string().uuid(),
 }).passthrough();
 
+function deriveCreateIssueAssignmentWakeSkip(issue: { assigneeAgentId: string | null; status: string }) {
+  const assignmentWakeSkipped = !issue.assigneeAgentId || issue.status === "backlog";
+  return {
+    assignmentWakeSkipped,
+    assignmentWakeSkipReason: assignmentWakeSkipped
+      ? issue.assigneeAgentId
+        ? "assigned_backlog"
+        : "no_agent_assignee"
+      : null,
+  };
+}
+
 function buildCreateIssueActivityStatusDetails(
   issue: { assigneeAgentId: string | null; status: string },
   res: Response,
@@ -443,17 +455,11 @@ function buildCreateIssueActivityStatusDetails(
   const statusDefault = res.locals.createIssueStatusDefault as
     | ReturnType<typeof resolveCreateIssueStatusDefault>
     | undefined;
-  const assignmentWakeSkipped = !issue.assigneeAgentId || issue.status === "backlog";
   return {
     status: issue.status,
     statusDefaulted: statusDefault?.defaulted ?? false,
     statusDefaultReason: statusDefault?.reason ?? "explicit",
-    assignmentWakeSkipped,
-    assignmentWakeSkipReason: assignmentWakeSkipped
-      ? issue.assigneeAgentId
-        ? "assigned_backlog"
-        : "no_agent_assignee"
-      : null,
+    ...deriveCreateIssueAssignmentWakeSkip(issue),
   };
 }
 
@@ -7933,6 +7939,7 @@ export function issueRoutes(
 
     res.status(201).json({
       ...issue,
+      ...deriveCreateIssueAssignmentWakeSkip(issue),
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
     });
@@ -8109,7 +8116,7 @@ export function issueRoutes(
     });
     await queueTaskWatchdogEvaluation(issue, actor.runId);
 
-    res.status(201).json(issue);
+    res.status(201).json({ ...issue, ...deriveCreateIssueAssignmentWakeSkip(issue) });
   });
 
   router.get("/issues/:id/accepted-plan-decompositions", async (req, res) => {
