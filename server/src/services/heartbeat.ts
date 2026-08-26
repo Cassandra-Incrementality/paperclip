@@ -446,6 +446,74 @@ function readHeartbeatRunErrorFamily(
   return null;
 }
 
+// Recovery bookkeeping for reconcileErroredAgents (the agent-scoped error
+// sweep). Keyed under agents.metadata so attempt counts survive idle<->error
+// flapping independent of any single issue/run lifecycle - this is the
+// missing piece described in PPC-3290: the only prior retries were bound to
+// the issue that killed the agent, so they never fired once nothing routed
+// work through that issue anymore.
+const AGENT_ERROR_RECOVERY_METADATA_KEY = "errorRecovery";
+const DEFAULT_AGENT_ERROR_RECOVERY_COOLDOWN_MS = 30 * 60 * 1000;
+const DEFAULT_AGENT_ERROR_RECOVERY_MAX_ATTEMPTS = 3;
+const AGENT_ERROR_STALE_ALERT_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+
+interface AgentErrorRecoveryMetadata {
+  attempts: number;
+  lastAttemptAt: string | null;
+  lastErrorFamily: string | null;
+  exhaustedAt: string | null;
+}
+
+function resolveAgentErrorRecoveryCooldownMs(env: Record<string, string | undefined>): number {
+  const raw = Number(env.AGENT_ERROR_RECOVERY_COOLDOWN_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_AGENT_ERROR_RECOVERY_COOLDOWN_MS;
+}
+
+function resolveAgentErrorRecoveryMaxAttempts(env: Record<string, string | undefined>): number {
+  const raw = Number(env.AGENT_ERROR_RECOVERY_MAX_ATTEMPTS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_AGENT_ERROR_RECOVERY_MAX_ATTEMPTS;
+}
+
+function readAgentErrorRecoveryMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+): AgentErrorRecoveryMetadata {
+  const raw = parseObject(metadata)[AGENT_ERROR_RECOVERY_METADATA_KEY];
+  const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const attempts = Number(record.attempts);
+  return {
+    attempts: Number.isFinite(attempts) && attempts > 0 ? Math.floor(attempts) : 0,
+    lastAttemptAt: readNonEmptyString(record.lastAttemptAt),
+    lastErrorFamily: readNonEmptyString(record.lastErrorFamily),
+    exhaustedAt: readNonEmptyString(record.exhaustedAt),
+  };
+}
+
+function hasAgentErrorRecoveryMetadata(metadata: Record<string, unknown> | null | undefined): boolean {
+  return AGENT_ERROR_RECOVERY_METADATA_KEY in parseObject(metadata);
+}
+
+function withAgentErrorRecoveryMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+  recovery: AgentErrorRecoveryMetadata,
+): Record<string, unknown> {
+  return { ...parseObject(metadata), [AGENT_ERROR_RECOVERY_METADATA_KEY]: recovery };
+}
+
+function withoutAgentErrorRecoveryMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const { [AGENT_ERROR_RECOVERY_METADATA_KEY]: _removed, ...rest } = parseObject(metadata);
+  return rest;
+}
+
+// Families the periodic agent-error sweep will auto-clear. Deliberately the
+// same taxonomy as readHeartbeatRunErrorFamily above (provider_quota,
+// transient_upstream) - reused as-is rather than re-derived from free text,
+// per PPC-3291 scope (do not write a second taxonomy; that is PPC-3260's job).
+function isAgentErrorFamilyAutoRetryable(family: string | null): boolean {
+  return family === "provider_quota" || family === "transient_upstream";
+}
+
 function isMaxTurnExhaustionRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
@@ -11252,6 +11320,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "idle"
           : "error";
 
+    // A genuine successful run is proof the agent is healthy again - drop the
+    // reconcileErroredAgents attempt counter so a later transient error gets
+    // the full retry budget instead of inheriting exhaustion from an
+    // unrelated incident. keepIdleOnFailure intentionally does not qualify:
+    // that path means the run still failed, just without parking in error.
+    const shouldResetErrorRecoveryMetadata =
+      nextStatus === "idle" && outcome === "succeeded" && hasAgentErrorRecoveryMetadata(existing.metadata);
+
     const updated = await db
       .update(agents)
       .set({
@@ -11260,6 +11336,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // error so operators see it on the agent page without digging into run
         // events; clear it whenever the agent leaves error.
         errorReason: nextStatus === "error" ? truncateAgentErrorReason(failureReason) : null,
+        ...(shouldResetErrorRecoveryMetadata
+          ? { metadata: withoutAgentErrorRecoveryMetadata(existing.metadata) }
+          : {}),
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -11286,6 +11365,153 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
     }
+  }
+
+  // Agent-scoped, issue-independent recovery sweep for agents parked in
+  // status = 'error' (PPC-3291, delta on PPC-3290). finalizeAgentStatus above
+  // is the only writer of status = 'error', and error is nominally invokable
+  // - but 29/33 agents have no heartbeat timer (tickTimers skips
+  // !policy.enabled) and the only automatic retries are bound to the issue
+  // that killed the agent, so once nothing routes work through that issue the
+  // agent is dead forever. This job does not depend on any issue: it scans
+  // agents directly on a cooldown, reuses the run-error-family classifier
+  // above, and clears with the same CAS semantics as agents.ts's clearError
+  // so a concurrently-recovering (or manually-cleared/paused/terminated)
+  // agent is never clobbered.
+  async function reconcileErroredAgents(now: Date = new Date()): Promise<{
+    scanned: number;
+    cleared: number;
+    clearedAgentIds: string[];
+    exhausted: number;
+    exhaustedAgentIds: string[];
+    skippedNotRetryable: number;
+    skippedCooldown: number;
+    staleErrorAgentIds: string[];
+  }> {
+    const cooldownMs = resolveAgentErrorRecoveryCooldownMs(runtimeEnv);
+    const maxAttempts = resolveAgentErrorRecoveryMaxAttempts(runtimeEnv);
+    const cutoff = new Date(now.getTime() - cooldownMs);
+
+    // status = 'error' already excludes paused/terminated agents outright
+    // (mirrors the guard in finalizeAgentStatus above), and the CAS update
+    // below re-checks status = 'error' at commit time, so an agent that gets
+    // paused/terminated/manually cleared between this select and that update
+    // is simply skipped, never clobbered.
+    const candidates = await db
+      .select({
+        id: agents.id,
+        companyId: agents.companyId,
+        metadata: agents.metadata,
+        updatedAt: agents.updatedAt,
+      })
+      .from(agents)
+      .where(and(eq(agents.status, "error"), lt(agents.updatedAt, cutoff)));
+
+    let cleared = 0;
+    let exhausted = 0;
+    let skippedNotRetryable = 0;
+    let skippedCooldown = 0;
+    const clearedAgentIds: string[] = [];
+    const exhaustedAgentIds: string[] = [];
+    const staleErrorAgentIds: string[] = [];
+
+    for (const candidate of candidates) {
+      if (now.getTime() - new Date(candidate.updatedAt).getTime() >= AGENT_ERROR_STALE_ALERT_THRESHOLD_MS) {
+        staleErrorAgentIds.push(candidate.id);
+      }
+
+      const recovery = readAgentErrorRecoveryMetadata(candidate.metadata);
+
+      if (recovery.attempts >= maxAttempts) {
+        // Bounded: a genuinely broken agent must not flap idle/error forever.
+        // Stop clearing and leave it in error - the existing agent_error_alert
+        // (attention.ts) already surfaces any status = 'error' agent to a
+        // human, so no separate alert is needed here. Deliberately does not
+        // touch updatedAt: that field is the "age of the error" signal
+        // (health-summary + the daily report), and marking exhaustion is
+        // bookkeeping, not a new incident.
+        if (!recovery.exhaustedAt) {
+          await db
+            .update(agents)
+            .set({
+              metadata: withAgentErrorRecoveryMetadata(candidate.metadata, {
+                ...recovery,
+                exhaustedAt: now.toISOString(),
+              }),
+            })
+            .where(and(eq(agents.id, candidate.id), eq(agents.status, "error")));
+        }
+        exhausted += 1;
+        exhaustedAgentIds.push(candidate.id);
+        continue;
+      }
+
+      const requiredBackoffMs = cooldownMs * 2 ** recovery.attempts;
+      const lastAttemptAt = recovery.lastAttemptAt ? new Date(recovery.lastAttemptAt) : null;
+      if (lastAttemptAt && now.getTime() - lastAttemptAt.getTime() < requiredBackoffMs) {
+        skippedCooldown += 1;
+        continue;
+      }
+
+      const lastRun = await db
+        .select({ errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, candidate.companyId), eq(heartbeatRuns.agentId, candidate.id)))
+        .orderBy(desc(heartbeatRuns.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      const errorFamily = lastRun ? readHeartbeatRunErrorFamily(lastRun) : null;
+      if (!isAgentErrorFamilyAutoRetryable(errorFamily)) {
+        skippedNotRetryable += 1;
+        continue;
+      }
+
+      const nextRecovery: AgentErrorRecoveryMetadata = {
+        attempts: recovery.attempts + 1,
+        lastAttemptAt: now.toISOString(),
+        lastErrorFamily: errorFamily,
+        exhaustedAt: null,
+      };
+
+      const updated = await db
+        .update(agents)
+        .set({
+          status: "idle",
+          errorReason: null,
+          metadata: withAgentErrorRecoveryMetadata(candidate.metadata, nextRecovery),
+          updatedAt: new Date(),
+        })
+        .where(and(eq(agents.id, candidate.id), eq(agents.status, "error")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (!updated) continue; // lost the CAS race (concurrent sweep or manual action) - no-op
+
+      cleared += 1;
+      clearedAgentIds.push(candidate.id);
+      publishLiveEvent({
+        companyId: updated.companyId,
+        type: "agent.status",
+        payload: {
+          agentId: updated.id,
+          status: updated.status,
+          lastHeartbeatAt: updated.lastHeartbeatAt ? new Date(updated.lastHeartbeatAt).toISOString() : null,
+          outcome: "auto_recovered",
+        },
+      });
+    }
+
+    return {
+      scanned: candidates.length,
+      cleared,
+      clearedAgentIds,
+      exhausted,
+      exhaustedAgentIds,
+      skippedNotRetryable,
+      skippedCooldown,
+      staleErrorAgentIds,
+    };
   }
 
   function mergeRunStopMetadataForAgent(
@@ -17228,6 +17454,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+
+    reconcileErroredAgents,
 
     scheduleBoundedRetry: async (
       runId: string,

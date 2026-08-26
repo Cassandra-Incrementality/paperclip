@@ -584,6 +584,64 @@ export function agentService(db: Db) {
       return normalizeAgentRows(hydrated, allCompanyRows);
     },
 
+    // Dead-agent instrumentation (PPC-3290/PPC-3291): the "6 of 33 agents in
+    // error" state was only discovered by hand-probing the plain agent list
+    // during a daily report and computing ages client-side. This gives the
+    // daily health check (PPC-3256) and any other caller one place to read
+    // agent counts by status plus, for every errored agent, how long it has
+    // been dead - the signal that actually matters (CS Ops sat 21 days,
+    // Motion Editor 39).
+    healthSummary: async (
+      companyId: string,
+      options?: { staleErrorThresholdMs?: number; now?: Date },
+    ) => {
+      const now = options?.now ?? new Date();
+      const staleErrorThresholdMs = options?.staleErrorThresholdMs ?? 24 * 60 * 60 * 1000;
+
+      const rows = await db
+        .select({
+          id: agents.id,
+          name: agents.name,
+          role: agents.role,
+          status: agents.status,
+          errorReason: agents.errorReason,
+          updatedAt: agents.updatedAt,
+        })
+        .from(agents)
+        .where(eq(agents.companyId, companyId));
+
+      const byStatus: Record<string, number> = {};
+      for (const row of rows) {
+        byStatus[row.status] = (byStatus[row.status] ?? 0) + 1;
+      }
+
+      const erroredAgents = rows
+        .filter((row) => row.status === "error")
+        .map((row) => {
+          const erroredSince = row.updatedAt ?? now;
+          const ageMs = Math.max(0, now.getTime() - new Date(erroredSince).getTime());
+          return {
+            id: row.id,
+            name: row.name,
+            role: row.role,
+            errorReason: row.errorReason,
+            erroredSince: new Date(erroredSince).toISOString(),
+            ageHours: Math.round((ageMs / (60 * 60 * 1000)) * 10) / 10,
+            staleErrorAlert: ageMs >= staleErrorThresholdMs,
+          };
+        })
+        .sort((a, b) => b.ageHours - a.ageHours);
+
+      return {
+        companyId,
+        generatedAt: now.toISOString(),
+        totalAgents: rows.length,
+        byStatus,
+        erroredAgents,
+        hasStaleError: erroredAgents.some((agent) => agent.staleErrorAlert),
+      };
+    },
+
     getById,
 
     create: async (companyId: string, data: Omit<typeof agents.$inferInsert, "companyId">, options?: CreateAgentOptions) => {
