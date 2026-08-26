@@ -541,8 +541,16 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const activeRunCount = latestRuns.filter((run) =>
       ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
     ).length;
+    // PPC-4007: issues.startedAt is only cleared when the issue itself completes
+    // or cancels -- a run that dies (process_lost, failed, etc.) with nothing left
+    // to resume it leaves startedAt in place forever, so elapsed time measures
+    // wall-clock since the run died rather than live work. Require actual run
+    // evidence in the trailing windows (or a run active right now) before trusting
+    // the elapsed clock; an issue with no live execution path is a stranded issue
+    // for the recovery sweep to find, not a long-running productivity concern.
+    const hasLiveExecutionPath = activeRunCount > 0 || runCountLastHour > 0 || runCountLastSixHours > 0;
     const activeStartedAt = sourceIssue.startedAt ?? sourceIssue.executionLockedAt ?? null;
-    const elapsedMs = sourceIssue.status === "in_progress" && activeStartedAt
+    const elapsedMs = sourceIssue.status === "in_progress" && activeStartedAt && hasLiveExecutionPath
       ? Math.max(0, now.getTime() - activeStartedAt.getTime())
       : null;
 
@@ -634,9 +642,12 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       ).join("\n")
       : "- none";
     const latestComments = evidence.latestComments.length > 0
-      ? evidence.latestComments.map((comment) =>
-        `- ${comment.createdAt.toISOString()}${comment.createdByRunId ? ` run \`${comment.createdByRunId}\`` : ""}: ${truncateInline(comment.body)}`,
-      ).join("\n")
+      ? evidence.latestComments.map((comment) => {
+        // PPC-4007: a quoted comment must never read as current state -- age-stamp
+        // it relative to when this review's evidence was generated.
+        const ageMs = Math.max(0, evidence.generatedAt.getTime() - comment.createdAt.getTime());
+        return `- ${comment.createdAt.toISOString()} (posted ${msToHuman(ageMs)} ago)${comment.createdByRunId ? ` run \`${comment.createdByRunId}\`` : ""}: ${truncateInline(comment.body)}`;
+      }).join("\n")
       : "- none";
     const usage = evidence.usageSamples.length > 0
       ? evidence.usageSamples.map((sample) => `- \`${sample.runId}\`: \`${JSON.stringify(sample.usageJson).slice(0, 500)}\``).join("\n")
