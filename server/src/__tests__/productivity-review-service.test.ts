@@ -482,11 +482,20 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(4);
   });
 
-  it("creates a long-active review without enabling a continuation hold", async () => {
+  it("creates a long-active review without enabling a continuation hold when a run is actually live", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
       status: "in_progress",
       startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // A run 30 minutes ago proves there is a live execution path behind the
+    // 7-hour-old episode, so the long-active clock is trustworthy here.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: new Date(now.getTime() - 30 * 60 * 1000),
     });
     const service = productivityReviewService(db);
 
@@ -503,6 +512,51 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
     expect(review?.priority).toBe("medium");
     expect(hold.held).toBe(false);
+  });
+
+  it("does not create a long-active review for a stranded episode with no live execution path (PPC-4007)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    // Mirrors PPC-3841: the issue has been "in_progress" for days per
+    // issues.startedAt, but its run died long ago and nothing ever resumed it --
+    // zero runs in any window, zero active runs. This is a stranded issue for
+    // the recovery sweep, not a productivity-review candidate.
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 13 * 24 * 60 * 60 * 1000),
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("age-stamps replayed assignee comments so they cannot read as current state (PPC-4007)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: new Date(now.getTime() - 30 * 60 * 1000),
+      withRunComments: true,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("(posted 30m ago)");
   });
 
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {
