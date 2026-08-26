@@ -451,8 +451,12 @@ describeEmbeddedPostgres("attention service", () => {
         fingerprint: "agent-recovery",
         evidence: {},
         nextAction: "Agent should self-heal.",
-        createdAt: new Date("2026-07-09T12:05:30.000Z"),
-        updatedAt: new Date("2026-07-09T12:05:30.000Z"),
+        // PPC-3963 (G4): fresh + healthy-owner agent recovery rows stay excluded by
+        // default -- createdAt must be "now", not a fixed past fixture date, or this
+        // row ages past the 24h attention threshold as real time passes and starts
+        // failing this "excludes non-human" assertion for reasons unrelated to it.
+        createdAt: new Date(),
+        updatedAt: new Date(),
       },
     ]);
 
@@ -692,6 +696,102 @@ describeEmbeddedPostgres("attention service", () => {
       agentName: "Broken Agent",
       failureReasonExcerpt: "adapter config missing",
     });
+  });
+
+  // PPC-3963 (G4/D4): agent-owned recovery actions were invisible to this feed
+  // entirely -- 218 of them sat active for 13 days while every dashboard read
+  // green. A stale (>24h) or unhealthy-owner agent recovery action must surface
+  // as a warning row, same as a human-owned one.
+  it("surfaces an agent-owned recovery action once it is stale or its owner is unhealthy", async () => {
+    const { companyId, workerId, errorAgentId } = await seedCompany("ATG");
+    const staleSourceIssueId = await insertIssue({
+      companyId,
+      identifier: "ATG-1",
+      title: "Stale agent recovery source",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+    const unhealthySourceIssueId = await insertIssue({
+      companyId,
+      identifier: "ATG-2",
+      title: "Unhealthy-owner agent recovery source",
+      status: "in_progress",
+      assigneeAgentId: errorAgentId,
+    });
+    const freshHealthySourceIssueId = await insertIssue({
+      companyId,
+      identifier: "ATG-3",
+      title: "Fresh healthy agent recovery source",
+      status: "in_progress",
+      assigneeAgentId: workerId,
+    });
+
+    await db.insert(issueRecoveryActions).values([
+      {
+        id: randomUUID(),
+        companyId,
+        sourceIssueId: staleSourceIssueId,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: workerId,
+        ownerUserId: null,
+        cause: "stranded_assigned_issue",
+        fingerprint: "stale-agent-recovery",
+        evidence: {},
+        nextAction: "Restore a live execution path.",
+        createdAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+        updatedAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        sourceIssueId: unhealthySourceIssueId,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: errorAgentId,
+        ownerUserId: null,
+        cause: "stranded_assigned_issue",
+        fingerprint: "unhealthy-owner-agent-recovery",
+        evidence: {},
+        nextAction: "Restore a live execution path.",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        sourceIssueId: freshHealthySourceIssueId,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: workerId,
+        ownerUserId: null,
+        cause: "stranded_assigned_issue",
+        fingerprint: "fresh-healthy-agent-recovery",
+        evidence: {},
+        nextAction: "Restore a live execution path.",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ]);
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const recoveryItems = feed.items.filter((item) => item.sourceKind === "recovery_action");
+    const bySourceIssueId = new Map(
+      recoveryItems.map((item) => [item.subject.metadata?.sourceIssueId, item]),
+    );
+
+    expect(bySourceIssueId.get(staleSourceIssueId)).toBeTruthy();
+    expect(bySourceIssueId.get(unhealthySourceIssueId)).toBeTruthy();
+    expect(bySourceIssueId.get(freshHealthySourceIssueId)).toBeUndefined();
+
+    for (const sourceIssueId of [staleSourceIssueId, unhealthySourceIssueId]) {
+      const item = bySourceIssueId.get(sourceIssueId)!;
+      expect(item.whyNow).toContain("over 24h");
+      expect(item.entryRule).toContain("owner_type = 'agent'");
+    }
   });
 
   it("returns addressed interactions to board attention after addressee pause or termination", async () => {

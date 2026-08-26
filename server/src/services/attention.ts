@@ -100,6 +100,15 @@ const SOURCE_RANK: Record<AttentionSourceKind, number> = {
 const PENDING_INTERACTION_STATUSES = ["pending"] as const;
 const OPEN_RECOVERY_STATUSES = ["active", "escalated"] as const;
 const HUMAN_RECOVERY_OWNER_TYPES = ["user", "board"] as const;
+// PPC-3963 (G4/D4): agent-owned recovery actions (ownerType: "agent") used to be
+// invisible to this feed entirely -- 218 of them sat active for 13 days while
+// every dashboard read green. Surface one once it has gone stale long enough that
+// a live owner alone can no longer be trusted to resolve it. This is a warning
+// signal layered on top of the existing human-owned rows, not a change to
+// recovery routing/ownership itself -- same shape as getAgentOrgChainHealth's
+// pausedAncestors warning (agent-eligibility.ts).
+const AGENT_RECOVERY_ACTION_ATTENTION_AGE_MS = 24 * 60 * 60 * 1000;
+const AGENT_RECOVERY_ACTION_ATTENTION_HEALTHY_STATUSES = new Set(["idle", "running"]);
 const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"] as const;
 const FAILED_RUN_STATUSES = ["failed", "timed_out"] as const;
 const DETAIL_EXCERPT_LENGTH = 160;
@@ -1318,15 +1327,37 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         }));
       }
 
-      const recoveryRows = await db
+      const openRecoveryRows = await db
         .select()
         .from(issueRecoveryActions)
         .where(and(
           eq(issueRecoveryActions.companyId, companyId),
           inArray(issueRecoveryActions.status, [...OPEN_RECOVERY_STATUSES]),
-          inArray(issueRecoveryActions.ownerType, [...HUMAN_RECOVERY_OWNER_TYPES]),
+          inArray(issueRecoveryActions.ownerType, [...HUMAN_RECOVERY_OWNER_TYPES, "agent"]),
         ))
         .orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id));
+      const agentOwnedRecoveryRows = openRecoveryRows.filter((row) => row.ownerType === "agent" && row.ownerAgentId);
+      const agentRecoveryOwnerStatusMap = agentOwnedRecoveryRows.length > 0
+        ? new Map(
+          (await db
+            .select({ id: agents.id, status: agents.status })
+            .from(agents)
+            .where(and(
+              eq(agents.companyId, companyId),
+              inArray(agents.id, [...new Set(agentOwnedRecoveryRows.map((row) => row.ownerAgentId!))]),
+            )))
+            .map((agent) => [agent.id, agent.status]),
+        )
+        : new Map<string, string>();
+      const agentRecoveryAttentionCutoff = new Date(now - AGENT_RECOVERY_ACTION_ATTENTION_AGE_MS);
+      const recoveryRows = openRecoveryRows.filter((row) => {
+        if ((HUMAN_RECOVERY_OWNER_TYPES as readonly string[]).includes(row.ownerType)) return true;
+        if (row.ownerType !== "agent" || !row.ownerAgentId) return false;
+        const staleByAge = row.createdAt.getTime() <= agentRecoveryAttentionCutoff.getTime();
+        const ownerStatus = agentRecoveryOwnerStatusMap.get(row.ownerAgentId);
+        const ownerUnhealthy = !ownerStatus || !AGENT_RECOVERY_ACTION_ATTENTION_HEALTHY_STATUSES.has(ownerStatus);
+        return staleByAge || ownerUnhealthy;
+      });
       const [recoveryIssueMap, recoveryImageMap] = await Promise.all([
         issueSummaryMap(
           db,
@@ -1339,6 +1370,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
       for (const recovery of recoveryRows) {
         const sourceIssue = recoveryIssueMap.get(recovery.sourceIssueId) ?? null;
         const recoveryIssue = recovery.recoveryIssueId ? recoveryIssueMap.get(recovery.recoveryIssueId) ?? null : null;
+        const isStaleAgentOwned = recovery.ownerType === "agent";
         const dedupKey = `recovery:${recovery.kind}:${recovery.sourceIssueId}:${recovery.cause}:${recovery.fingerprint}`;
         add(createItem({
           companyId,
@@ -1356,21 +1388,25 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
               cause: recovery.cause,
               ownerType: recovery.ownerType,
               ownerUserId: recovery.ownerUserId,
+              ownerAgentId: recovery.ownerAgentId,
               sourceIssueId: recovery.sourceIssueId,
               recoveryIssueId: recovery.recoveryIssueId,
             },
           },
-          whyNow: recovery.status === "escalated"
-            ? "Recovery action escalated to a human owner."
-            : "Recovery action is assigned to a human owner.",
+          whyNow: isStaleAgentOwned
+            ? "Recovery action has been assigned to an agent owner for over 24h, or that owner is not healthy — it may be stuck."
+            : recovery.status === "escalated"
+              ? "Recovery action escalated to a human owner."
+              : "Recovery action is assigned to a human owner.",
           decisionVerbs: decisionVerbs(
             { id: "resolve", label: "Resolve", description: "Record the recovery outcome." },
             { id: "reassign", label: "Reassign", description: "Move the recovery to another owner." },
             { id: "cancel", label: "Cancel", description: "Cancel the recovery action." },
           ),
           inlineResolvable: false,
-          entryRule: "issue_recovery_actions.status in ('active','escalated') and owner_type in ('user','board')",
-          exitRule: "Recovery action resolves, is cancelled, or moves back to an agent/system owner.",
+          entryRule: "issue_recovery_actions.status in ('active','escalated') and (owner_type in ('user','board') " +
+            "or (owner_type = 'agent' and (age > 24h or owner status not in ('idle','running'))))",
+          exitRule: "Recovery action resolves, is cancelled, or moves back to a healthy, recently-active agent owner.",
           dedupKey,
           severity: recovery.status === "escalated" ? "high" : "medium",
           activityAt: toIso(recovery.updatedAt),

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, not, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lte, not, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -390,6 +390,15 @@ export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
 // inside that while still comfortably covering weekly resets.
 export const PROVIDER_QUOTA_RECOVERY_MAX_HORIZON_MS = 48 * 60 * 60 * 1000;
 
+// PPC-3963: a stranded_assigned_issue recovery action used to escalate an issue to
+// `blocked`, fire one wake, and never look again -- when the owner never woke (or
+// was itself dead), the action sat at attemptCount: 1 forever with every dashboard
+// reading green. These bound the retry loop so it must terminate in a live owner
+// or on the board's desk.
+const STRANDED_ASSIGNED_ISSUE_REATTEMPT_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const STRANDED_ASSIGNED_ISSUE_RECOVERY_MAX_ATTEMPTS = 3;
+const STRANDED_ASSIGNED_ISSUE_RECOVERY_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
 
@@ -741,6 +750,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   async function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
     return (await evaluateAgentInvokabilityFromDb(db, agent)).invokable;
+  }
+
+  // PPC-3963 (D2): INVOKABLE_AGENT_STATUSES (agent-eligibility.ts) intentionally keeps
+  // "error" invokable fleet-wide -- that is what lets an errored agent be woken to
+  // recover itself. Recovery *ownership* is a narrower question: an errored agent
+  // cannot act as the manager/creator/executive owner that recovers someone else's
+  // stranded issue. Scoped to the owner-ladder accept check only; composes the
+  // existing isAgentInvokable rather than duplicating status-set logic.
+  async function isAgentHealthyForRecoveryOwnership(agent: typeof agents.$inferSelect | null | undefined) {
+    return (await isAgentInvokable(agent)) && agent?.status !== "error";
   }
 
   async function getLatestIssueRun(companyId: string, issueId: string): Promise<LatestIssueRun> {
@@ -2569,7 +2588,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issueId: issue.id,
         projectId: issue.projectId,
       });
-      if ((await isAgentInvokable(candidate)) && !budgetBlock) return candidate.id;
+      if ((await isAgentHealthyForRecoveryOwnership(candidate)) && !budgetBlock) return candidate.id;
     }
 
     return null;
@@ -2594,9 +2613,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
     preferredOwnerAgentId?: string | null;
+    forceBoardEscalation?: boolean;
   }) {
     const originalAgentId = input.latestRun?.agentId ?? input.issue.assigneeAgentId;
     const returnOwnerAgentId = input.issue.assigneeAgentId ?? originalAgentId;
+    // PPC-3963 (G3): the owner-ladder retry budget is exhausted (maxAttempts or
+    // timeoutAt) -- terminate to the board rather than trusting the ladder again.
+    if (input.forceBoardEscalation) {
+      return {
+        ownerAgentId: null,
+        returnOwnerAgentId,
+        routingFallbackReason:
+          "The stranded-issue recovery action reached its retry budget (max attempts or timeout); escalating to the board instead of the owner ladder.",
+      };
+    }
     const routeToOriginal = input.recoveryCause === "process_lost" ||
       input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON ||
       input.recoveryCause === "codex_output_inactivity_monitor";
@@ -2881,20 +2911,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    forceBoardEscalation?: boolean;
   }) {
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
+    const kind = strandedRecoveryActionKind(recoveryCause);
     const routing = await resolveStrandedRecoveryRouting({
       issue: input.issue,
       latestRun: input.latestRun,
       recoveryCause,
       preferredOwnerAgentId: input.recoveryOwnerAgentId,
+      forceBoardEscalation: input.forceBoardEscalation,
     });
     const ownerAgentId = routing.ownerAgentId;
     const now = new Date();
+    // PPC-3963 (G3): bound the stranded_assigned_issue owner-ladder retry loop.
+    // timeoutAt is a fixed deadline from the FIRST stranding, not extended on each
+    // re-attempt -- upsertSourceScoped always overwrites whatever is passed, so
+    // carry the still-active action's original deadline forward instead of
+    // recomputing "now + 24h" on every retry.
+    let strandedMaxAttempts: number | null = null;
+    let strandedTimeoutAt: Date | null = null;
+    if (kind === "stranded_assigned_issue") {
+      const existingAction = await recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id);
+      strandedMaxAttempts = STRANDED_ASSIGNED_ISSUE_RECOVERY_MAX_ATTEMPTS;
+      strandedTimeoutAt = existingAction?.kind === "stranded_assigned_issue" && existingAction.timeoutAt
+        ? new Date(existingAction.timeoutAt)
+        : new Date(now.getTime() + STRANDED_ASSIGNED_ISSUE_RECOVERY_TIMEOUT_MS);
+    }
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
-      kind: strandedRecoveryActionKind(recoveryCause),
+      kind,
       ownerType: recoveryCause === "provider_quota" && !ownerAgentId ? "system" : ownerAgentId ? "agent" : "board",
       ownerAgentId,
       previousOwnerAgentId: input.issue.assigneeAgentId,
@@ -2959,7 +3006,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       monitorPolicy: recoveryCause === "provider_quota" && !ownerAgentId
         ? { type: "wait_recovery", retryAgentId: routing.returnOwnerAgentId }
         : null,
-      maxAttempts: null,
+      maxAttempts: strandedMaxAttempts,
+      timeoutAt: strandedTimeoutAt,
       lastAttemptAt: now,
     });
 
@@ -3317,6 +3365,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    forceBoardEscalation?: boolean;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -3334,6 +3383,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recoveryCause,
       recoveryOwnerAgentId: input.recoveryOwnerAgentId,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+      forceBoardEscalation: input.forceBoardEscalation,
     });
     const isProviderQuotaWait = recoveryCause === "provider_quota" &&
       !recoveryAction.ownerAgentId &&
@@ -3474,12 +3524,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       },
     });
 
-    await enqueueSourceScopedStrandedRecoveryWake({
-      action: recoveryAction,
-      issue: input.issue,
-      latestRun: input.latestRun,
-      recoveryCause,
-    });
+    // PPC-3963 (G5): a "conflict" throw here (paused/terminated owner, budget block)
+    // must not abort the re-block reconciliation below -- the issue is already
+    // blocked with the recovery owner recorded; a failed wake just means nobody
+    // gets pinged this attempt, which the re-attempt sweep (G1) will retry.
+    try {
+      await enqueueSourceScopedStrandedRecoveryWake({
+        action: recoveryAction,
+        issue: input.issue,
+        latestRun: input.latestRun,
+        recoveryCause,
+      });
+    } catch (error) {
+      logger.warn(
+        { err: error, issueId: input.issue.id, recoveryActionId: recoveryAction.id },
+        "stranded-issue recovery wake enqueue failed; continuing re-block reconciliation",
+      );
+    }
 
     if (recoveryAction.ownerAgentId && recoveryAction.ownerAgentId === input.issue.assigneeAgentId) {
       const [currentIssue] = await db
@@ -3650,16 +3711,47 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
+    // PPC-3963 (G1, D1): the escalation below moves a stranded issue to `blocked`,
+    // which permanently moved it OUTSIDE this sweep's own candidate set -- so once
+    // an owner was picked, attemptCount could never advance past 1 even if that
+    // owner never woke (or was itself dead). Find blocked issues carrying a still
+    // "agent"-owned stranded_assigned_issue action whose lastAttemptAt is stale,
+    // and let them back into the candidate set -- ONLY under that join condition,
+    // so the general (non-blocked) candidate set is untouched.
+    const strandedReattemptCutoff = new Date(Date.now() - STRANDED_ASSIGNED_ISSUE_REATTEMPT_INTERVAL_MS);
+    const staleStrandedActionRows = await db
+      .select({ sourceIssueId: issueRecoveryActions.sourceIssueId })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.kind, "stranded_assigned_issue"),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          eq(issueRecoveryActions.ownerType, "agent"),
+          lte(issueRecoveryActions.lastAttemptAt, strandedReattemptCutoff),
+        ),
+      );
+    const staleBlockedStrandedIssueIds = [...new Set(staleStrandedActionRows.map((row) => row.sourceIssueId))];
+
     const candidates = await db
       .select()
       .from(issues)
       .where(
         and(
           isNull(issues.assigneeUserId),
-          inArray(issues.status, ["todo", "in_progress", "in_review"]),
           or(
-            sql`${issues.assigneeAgentId} is not null`,
-            eq(issues.status, "in_review"),
+            and(
+              inArray(issues.status, ["todo", "in_progress", "in_review"]),
+              or(
+                sql`${issues.assigneeAgentId} is not null`,
+                eq(issues.status, "in_review"),
+              ),
+            ),
+            staleBlockedStrandedIssueIds.length > 0
+              ? and(
+                eq(issues.status, "blocked"),
+                inArray(issues.id, staleBlockedStrandedIssueIds),
+              )
+              : undefined,
           ),
           opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
@@ -3704,7 +3796,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       const agentInvokable = agent && agent.companyId === issue.companyId
         ? await isAgentInvokable(agent)
         : false;
-      if (issue.status !== "in_review" && !agentInvokable) {
+      // A blocked issue's current assignee is the recovery owner Paperclip picked
+      // last time -- possibly the very owner this resweep exists to route away
+      // from (G1/D1). Do not gate on their invokability here; the branch below
+      // re-resolves ownership from scratch via the (now error-excluding, G2) ladder.
+      if (issue.status !== "in_review" && issue.status !== "blocked" && !agentInvokable) {
         result.skipped += 1;
         continue;
       }
@@ -3748,6 +3844,50 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.skipped += 1;
         continue;
       }
+
+      // PPC-3963 (G1/G3): this issue only reached `blocked` status in the candidate
+      // set via the stale-stranded-action join above -- re-resolve the recovery
+      // owner ladder (excluding unhealthy owners per G2) and bump attemptCount.
+      // Once the action's retry budget (maxAttempts/timeoutAt) is exhausted, force
+      // the board so the action terminates instead of looping forever.
+      if (issue.status === "blocked") {
+        const activeAction = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+        if (!activeAction || activeAction.kind !== "stranded_assigned_issue" || activeAction.ownerType !== "agent") {
+          result.skipped += 1;
+          continue;
+        }
+        const exhausted =
+          (activeAction.maxAttempts != null && activeAction.attemptCount >= activeAction.maxAttempts) ||
+          (activeAction.timeoutAt != null && new Date(activeAction.timeoutAt).getTime() <= recoveryNow.getTime());
+        const storedPreviousStatus = readNonEmptyString(parseObject(activeAction.evidence).previousStatus);
+        const previousStatus: StrandedPreviousStatus =
+          storedPreviousStatus === "todo" ||
+            storedPreviousStatus === "in_progress" ||
+            storedPreviousStatus === "in_review"
+            ? storedPreviousStatus
+            : "in_progress";
+        const updated = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus,
+          latestRun,
+          recoveryCause: "stranded_assigned_issue",
+          forceBoardEscalation: exhausted,
+          comment: exhausted
+            ? "Paperclip exhausted the recovery owner ladder's retry budget for this stranded issue " +
+              `(attempt ${activeAction.attemptCount + 1}, opened ${new Date(activeAction.createdAt).toISOString()}). ` +
+              "Escalating to the board: a recovery action must terminate in a live owner or on the board's desk."
+            : "Paperclip re-swept this stranded issue because its recovery owner did not resolve it within " +
+              "the re-attempt interval. Re-resolving the recovery owner ladder.",
+        });
+        if (updated) {
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+
       if (isStrandedIssueRecoveryIssue(issue) && isUnsuccessfulTerminalIssueRun(latestRun)) {
         const updated = await escalateStrandedRecoveryIssueInPlace({
           issue,

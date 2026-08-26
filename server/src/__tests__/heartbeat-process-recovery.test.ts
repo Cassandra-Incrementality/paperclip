@@ -1003,6 +1003,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
     if (!action) throw new Error("Expected source-scoped stranded recovery action to be created");
 
+    // PPC-3963 (G3): only the stranded_assigned_issue kind gets a bounded owner-ladder
+    // retry budget (maxAttempts + timeoutAt) -- other kinds (e.g. missing_disposition)
+    // are unaffected and still have no retry bound.
+    const isBoundedStrandedKind = (input.kind ?? "stranded_assigned_issue") === "stranded_assigned_issue";
     expect(action).toMatchObject({
       companyId: input.companyId,
       sourceIssueId: input.issueId,
@@ -1015,8 +1019,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       returnOwnerAgentId: input.returnOwnerAgentId ?? input.agentId,
       cause: input.cause ?? "stranded_assigned_issue",
       attemptCount: 1,
-      maxAttempts: null,
+      maxAttempts: isBoundedStrandedKind ? 3 : null,
     });
+    if (isBoundedStrandedKind) {
+      expect(action.timeoutAt).toBeTruthy();
+    }
     expect(action.evidence).toMatchObject({
       sourceIssueId: input.issueId,
       previousStatus: input.previousStatus,

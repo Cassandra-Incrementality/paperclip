@@ -330,6 +330,208 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  // PPC-3963: regression coverage for the stranded_assigned_issue recovery SPOF.
+  // A dead (status: "error") owner used to sit as the recovery action's
+  // ownerAgentId forever — the ladder picked it once (D2), the escalation moved
+  // the issue to `blocked` which excluded it from every future sweep (D1), and
+  // attemptCount could never advance past 1. 218 recovery actions sat this way
+  // for 13 days with every dashboard reading green.
+  it("excludes an errored recovery owner from the ladder and re-routes a stale stranded action past its first attempt", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const ceoId = randomUUID();
+    await db.insert(agents).values({
+      id: ceoId,
+      companyId,
+      name: "CEO",
+      role: "ceo",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // The CTO is latched in status: error -- simulating the historical bug state
+    // where the owner-ladder already picked a now-dead agent as the recovery owner.
+    await db.update(agents).set({ status: "error" }).where(eq(agents.id, managerId));
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: managerId })
+      .where(eq(issues.id, sourceIssueId));
+
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded_assigned_issue:manual-fixture-error-owner",
+      evidence: { previousStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+      maxAttempts: 3,
+      timeoutAt: new Date(Date.now() + 12 * 60 * 60 * 1000),
+      lastAttemptAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+    expect(action.attemptCount).toBe(1);
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toContain(sourceIssueId);
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow?.attemptCount).toBe(2);
+    expect(actionRow?.status).toBe("active");
+    expect(actionRow?.ownerAgentId).not.toBe(managerId);
+    expect(actionRow?.ownerAgentId).toBe(ceoId);
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({ status: "blocked", assigneeAgentId: ceoId });
+
+    expect(enqueueWakeup).toHaveBeenCalledWith(
+      ceoId,
+      expect.objectContaining({ reason: "source_scoped_recovery_action" }),
+    );
+  });
+
+  // D1: the sweep used to filter candidates to issues.status in
+  // (todo, in_progress, in_review) -- but escalation moves the source issue to
+  // `blocked`, which is permanently outside that set. This is the test that
+  // would have caught the whole incident: a blocked issue with a stale active
+  // stranded_assigned_issue action must re-enter the sweep even when its owner
+  // is perfectly healthy and simply never woke.
+  it("resweeps a blocked issue carrying a stale stranded_assigned_issue action instead of leaving it stuck at attempt 1 forever", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: managerId })
+      .where(eq(issues.id, sourceIssueId));
+
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const staleAction = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded_assigned_issue:manual-fixture-stale",
+      evidence: { previousStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+      maxAttempts: 3,
+      timeoutAt: new Date(Date.now() + 12 * 60 * 60 * 1000),
+      lastAttemptAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toContain(sourceIssueId);
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, staleAction.id));
+    expect(actionRow?.attemptCount).toBe(2);
+    expect(actionRow?.ownerAgentId).toBe(managerId);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not resweep a blocked stranded action inside the re-attempt interval", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: managerId })
+      .where(eq(issues.id, sourceIssueId));
+
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const freshAction = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded_assigned_issue:manual-fixture-fresh",
+      evidence: { previousStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+      maxAttempts: 3,
+      timeoutAt: new Date(Date.now() + 12 * 60 * 60 * 1000),
+      lastAttemptAt: new Date(),
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, freshAction.id));
+    expect(actionRow?.attemptCount).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  // G3: once the retry budget (maxAttempts/timeoutAt) is exhausted, the resweep
+  // must terminate to the board instead of trusting the ladder again -- a
+  // recovery action must end in a live owner or on the board's desk, never loop.
+  it("escalates a stale stranded action to the board once its retry budget is exhausted", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: managerId })
+      .where(eq(issues.id, sourceIssueId));
+
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const exhaustedAction = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded_assigned_issue:manual-fixture-exhausted",
+      evidence: { previousStatus: "in_progress" },
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+      maxAttempts: 3,
+      timeoutAt: new Date(Date.now() - 60 * 1000),
+      lastAttemptAt: new Date(Date.now() - 7 * 60 * 60 * 1000),
+    });
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(1);
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, exhaustedAction.id));
+    expect(actionRow?.ownerType).toBe("board");
+    expect(actionRow?.ownerAgentId).toBeNull();
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(updatedIssue).toMatchObject({ status: "blocked" });
+  });
+
   it.each([
     ["process_lost", undefined, "coder"],
     ["adapter_failed", "successful_run_missing_state", "coder"],
