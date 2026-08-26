@@ -1067,6 +1067,21 @@ export async function startServer(): Promise<StartedServer> {
 
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
+
+        const agentErrorRecovery = await heartbeat.reconcileErroredAgents();
+        if (agentErrorRecovery.cleared > 0 || agentErrorRecovery.exhausted > 0) {
+          logger.warn(
+            { ...agentErrorRecovery },
+            "startup agent error-state recovery sweep changed agent state",
+          );
+        }
+        if (agentErrorRecovery.staleErrorAgentIds.length > 0) {
+          logger.warn(
+            { staleErrorAgentIds: agentErrorRecovery.staleErrorAgentIds },
+            "agents parked in error status for over 24h",
+          );
+        }
+
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
         if (
           promotion.promoted > 0 ||
@@ -1282,6 +1297,24 @@ export async function startServer(): Promise<StartedServer> {
                 logger.warn(
                   { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
                   "periodic heartbeat recovery changed assigned issue state",
+                );
+              }
+            })
+            .then(async () => {
+              // Agent-scoped, issue-independent: agents parked in status =
+              // 'error' have no automatic retry once nothing routes work
+              // through the issue that killed them (PPC-3290/PPC-3291).
+              const agentErrorRecovery = await heartbeat.reconcileErroredAgents();
+              if (agentErrorRecovery.cleared > 0 || agentErrorRecovery.exhausted > 0) {
+                logger.warn(
+                  { ...agentErrorRecovery },
+                  "periodic agent error-state recovery sweep changed agent state",
+                );
+              }
+              if (agentErrorRecovery.staleErrorAgentIds.length > 0) {
+                logger.warn(
+                  { staleErrorAgentIds: agentErrorRecovery.staleErrorAgentIds },
+                  "agents parked in error status for over 24h",
                 );
               }
             })
