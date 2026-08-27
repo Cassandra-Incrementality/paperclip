@@ -13,7 +13,9 @@
   },
   "type": "module",
   "bin": {
-    "paperclip-mcp-server": "./dist/stdio.js"
+    "paperclip-mcp-server": "./dist/stdio.js",
+    "paperclip-mcp-http-server": "./dist/http-server.js",
+    "paperclip-mcp-login": "./dist/login.js"
   },
   "exports": {
     ".": "./src/index.ts"
@@ -21,7 +23,9 @@
   "publishConfig": {
     "access": "public",
     "bin": {
-      "paperclip-mcp-server": "./dist/stdio.js"
+      "paperclip-mcp-server": "./dist/stdio.js",
+      "paperclip-mcp-http-server": "./dist/http-server.js",
+      "paperclip-mcp-login": "./dist/login.js"
     },
     "exports": {
       ".": {
