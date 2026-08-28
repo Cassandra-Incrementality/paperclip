@@ -222,6 +222,7 @@ import {
   isSuccessfulRunHandoffValidPathSkip,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
+  findStaleErrorLatches,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
@@ -13116,6 +13117,108 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  // Stale error-latch reconciler (PPC-4088, 3rd recurrence of PPC-3948/PPC-4059).
+  // reconcileErroredAgents above only auto-clears errorFamily in
+  // {provider_quota, transient_upstream}; host auth/session-expiry failures
+  // are unclassified free text and fall through, so status = 'error' latches
+  // forever once one lands - the periodic "Agent liveness check" routine then
+  // re-pages the same latch every cycle since nothing else ever clears it.
+  // This sweep supplies the stronger, safer signal described on PPC-4088: if
+  // a DIFFERENT agent in the same company heartbeated successfully after the
+  // candidate's own error timestamp, the candidate's error is provably stale
+  // (the host/dispatcher were demonstrably healthy afterwards), independent
+  // of whatever the specific CLI-level auth blip was. Narrowly scoped to
+  // errorReason text matching known auth/session phrasing (see
+  // isHostAuthSessionErrorReason) so an unrelated genuine failure - e.g. an
+  // adapter execution timeout - is never auto-cleared just because some
+  // other agent happened to heartbeat later.
+  async function reconcileStaleErrorLatches(now: Date = new Date()): Promise<{
+    scanned: number;
+    cleared: number;
+    clearedAgentIds: string[];
+  }> {
+    const errorCandidates = await db
+      .select({ id: agents.id, companyId: agents.companyId })
+      .from(agents)
+      .where(eq(agents.status, "error"));
+
+    if (errorCandidates.length === 0) {
+      return { scanned: 0, cleared: 0, clearedAgentIds: [] };
+    }
+
+    // The proof an error is stale can come from any sibling in the same
+    // company, not just other errored agents, so the comparison pool has to
+    // be every agent in the affected companies - not just the error rows.
+    const companyIds = Array.from(new Set(errorCandidates.map((row) => row.companyId)));
+    const pool = await db
+      .select({
+        id: agents.id,
+        companyId: agents.companyId,
+        status: agents.status,
+        errorReason: agents.errorReason,
+        lastHeartbeatAt: agents.lastHeartbeatAt,
+        updatedAt: agents.updatedAt,
+      })
+      .from(agents)
+      .where(inArray(agents.companyId, companyIds));
+
+    const findings = findStaleErrorLatches(pool, now);
+    let cleared = 0;
+    const clearedAgentIds: string[] = [];
+
+    for (const finding of findings) {
+      // Same CAS semantics as agents.ts's clearError (and reconcileErroredAgents
+      // above): re-check status = 'error' at commit time so a concurrently
+      // recovering/manually-cleared/paused/terminated agent is never clobbered.
+      const updated = await db
+        .update(agents)
+        .set({
+          status: "idle",
+          pauseReason: null,
+          pausedAt: null,
+          errorReason: null,
+          updatedAt: now,
+        })
+        .where(and(eq(agents.id, finding.agentId), eq(agents.status, "error")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (!updated) continue; // lost the CAS race - no-op
+
+      cleared += 1;
+      clearedAgentIds.push(finding.agentId);
+
+      await logActivity(db, {
+        companyId: finding.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: finding.agentId,
+        action: "agent.error_cleared_stale_latch",
+        entityType: "agent",
+        entityId: finding.agentId,
+        details: {
+          erroredAt: finding.erroredAt.toISOString(),
+          provenByAgentId: finding.provenByAgentId,
+          provenByHeartbeatAt: finding.provenByHeartbeatAt.toISOString(),
+          reason: "stale_error_latch_auto_clear",
+        },
+      });
+
+      publishLiveEvent({
+        companyId: updated.companyId,
+        type: "agent.status",
+        payload: {
+          agentId: updated.id,
+          status: updated.status,
+          lastHeartbeatAt: updated.lastHeartbeatAt ? new Date(updated.lastHeartbeatAt).toISOString() : null,
+          outcome: "auto_recovered_stale_latch",
+        },
+      });
+    }
+
+    return { scanned: errorCandidates.length, cleared, clearedAgentIds };
+  }
+
   function mergeRunStopMetadataForAgent(
     agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
@@ -19262,6 +19365,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     resumeQueuedRuns,
 
     reconcileErroredAgents,
+    reconcileStaleErrorLatches,
 
     scheduleBoundedRetry: async (
       runId: string,

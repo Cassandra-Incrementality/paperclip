@@ -32,6 +32,14 @@ export {
   recoveryService,
 } from "./service.js";
 export {
+  findStaleErrorLatches,
+  isHostAuthSessionErrorReason,
+} from "./stale-error-latch.js";
+export type {
+  StaleErrorLatchAgentInput,
+  StaleErrorLatchFinding,
+} from "./stale-error-latch.js";
+export {
   DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS,
   RUN_LIVENESS_CONTINUATION_REASON,
   buildRunLivenessContinuationIdempotencyKey,

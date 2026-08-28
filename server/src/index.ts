@@ -1068,6 +1068,14 @@ export async function startServer(): Promise<StartedServer> {
         const promotion = await heartbeat.promoteDueScheduledRetries();
         await heartbeat.resumeQueuedRuns();
 
+        const staleErrorLatchRecovery = await heartbeat.reconcileStaleErrorLatches();
+        if (staleErrorLatchRecovery.cleared > 0) {
+          logger.warn(
+            { ...staleErrorLatchRecovery },
+            "startup stale error-latch sweep auto-cleared provably-stale agent errors",
+          );
+        }
+
         const agentErrorRecovery = await heartbeat.reconcileErroredAgents();
         if (agentErrorRecovery.cleared > 0 || agentErrorRecovery.exhausted > 0) {
           logger.warn(
@@ -1297,6 +1305,18 @@ export async function startServer(): Promise<StartedServer> {
                 logger.warn(
                   { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
                   "periodic heartbeat recovery changed assigned issue state",
+                );
+              }
+            })
+            .then(async () => {
+              // Cross-agent staleness proof for host auth/session latches
+              // (PPC-4088) - runs before the retry-based sweep below since a
+              // provable stale latch should never even reach that path.
+              const staleErrorLatchRecovery = await heartbeat.reconcileStaleErrorLatches();
+              if (staleErrorLatchRecovery.cleared > 0) {
+                logger.warn(
+                  { ...staleErrorLatchRecovery },
+                  "periodic stale error-latch sweep auto-cleared provably-stale agent errors",
                 );
               }
             })
