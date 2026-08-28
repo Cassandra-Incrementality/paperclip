@@ -9729,9 +9729,15 @@ export function issueRoutes(
         const assigneeId = issue.assigneeAgentId;
         const actorIsAgent = actor.actorType === "agent";
         const selfComment = actorIsAgent && actor.actorId === assigneeId;
-        const skipAssigneeCommentWake = selfComment || isClosed;
 
-        if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
+        // `reopened` must never override `selfComment`: an agent's own comment
+        // on its own issue must never queue a wake back to itself, even when
+        // the comment carried explicit reopen/resume intent. A self-queued
+        // wake dispatches a new run behind the agent's back, and if that new
+        // run and the current one both touch the issue's terminal status, the
+        // stale-lock sweep's issue-terminal authority can race the new run
+        // and terminalize it mid-flight as a false success (PPC-4106).
+        if (assigneeId && !assigneeChanged && !selfComment && (reopened || !isClosed)) {
           addWakeup(assigneeId, {
             source: "automation",
             triggerDetail: "system",
@@ -11542,8 +11548,12 @@ export function issueRoutes(
       // Re-derive closed-ness from the post-mutation issue so the auto-approval
       // transition (in_review -> done) suppresses a stale `issue_commented` wake
       // to the returnAssignee for an already-completed issue.
-      const skipWake = selfComment || isClosedIssueStatus(currentIssue.status);
-      if (assigneeId && (reopened || !skipWake)) {
+      //
+      // `reopened` must never override `selfComment` (PPC-4106): see the twin
+      // guard above the equivalent wake decision in the PATCH /issues/:id
+      // handler for why a self-queued wake is unsafe even when the comment
+      // carried explicit reopen/resume intent.
+      if (assigneeId && !selfComment && (reopened || !isClosedIssueStatus(currentIssue.status))) {
         if (reopened) {
           addWakeup(assigneeId, {
             source: "automation",

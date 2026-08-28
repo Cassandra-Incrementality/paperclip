@@ -300,6 +300,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       checkoutRunId: runningRunId,
       executionRunId: runningRunId,
       executionLockedAt: new Date(),
+      // The run (seeded with startedAt at seed() time, above) predates this
+      // transition, matching the real reuse-lease shape: the run that was
+      // live when the issue went "done" never terminalized its own row.
+      completedAt: new Date(),
     });
 
     const heartbeat = heartbeatService(db);
@@ -350,6 +354,8 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       checkoutRunId: runningRunId,
       executionRunId: runningRunId,
       executionLockedAt: new Date(),
+      // Run predates this transition — see the "issue done" reuse-lease test above.
+      cancelledAt: new Date(),
     });
 
     const heartbeat = heartbeatService(db);
@@ -363,6 +369,103 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .where(eq(heartbeatRuns.id, runningRunId))
       .then((rows) => rows[0]?.status);
     expect(runStatus).toBe("cancelled");
+  });
+
+  it("does not terminalize a live run that started AFTER its issue already went terminal (PPC-4106)", async () => {
+    // Reproduces the false-success bug: a self-comment on a done issue queued a
+    // wake, which dispatched a brand-new run against the same issue. The new
+    // run's startedAt is necessarily after the issue's completedAt. The old
+    // issue-terminal authority fired on status alone and killed this live run
+    // mid-flight, booking it as a fake "succeeded". The fixed authority must
+    // require the run to predate the transition, so it must leave this run
+    // alone and let the (also-passing) process-death authority be the only
+    // thing that can ever end it.
+    const { companyId, agentId, runningRunId } = await seed();
+    // process.pid is the live test process, so isPidAlive returns true — the
+    // run is genuinely live.
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: process.pid })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Issue already done before this run started",
+      status: "done",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+      // Strictly before seed()'s runningRunId.startedAt (set to `new Date()`
+      // moments earlier, inside seed()).
+      completedAt: new Date(Date.now() - 60_000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([]);
+    expect(result.cleared).toBe(0);
+
+    const runStatus = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId))
+      .then((rows) => rows[0]?.status);
+    expect(runStatus).toBe("running");
+
+    const lock = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lock).toEqual({ checkoutRunId: runningRunId, executionRunId: runningRunId });
+  });
+
+  it("still terminalizes via process-death authority a run that started after its issue went terminal, once the process is actually gone (PPC-4106)", async () => {
+    // Confirms the fix is a narrowing, not a deletion: a run that started
+    // after the issue's terminal transition and is genuinely dead must still
+    // get cleaned up — just via the process-death authority, not the
+    // issue-terminal one.
+    const { companyId, agentId, runningRunId } = await seed();
+    // A pid this large never maps to a live process, so isPidAlive returns
+    // false — the process is genuinely gone.
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: 2_000_000_000 })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Issue already done, run started after, but process is dead",
+      status: "done",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+      completedAt: new Date(Date.now() - 60_000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([runningRunId]);
+    expect(result.cleared).toBe(1);
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId))
+      .then((rows) => rows[0]);
+    // Process-death authority produces "interrupted", not "succeeded" — the
+    // issue-terminal authority (which would have produced a fake "succeeded")
+    // correctly declined to act here.
+    expect(run?.status).toBe("interrupted");
+    expect(run?.errorCode).toBe("orphaned_running_run");
   });
 
   it("does not terminalize a running run whose process is alive and whose issue is not terminal", async () => {

@@ -5657,6 +5657,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // column. It maps issue "done" to "succeeded" and issue "cancelled" to
       // "cancelled". A null value means the referencing issue is not terminal.
       referencingIssueTerminalStatus?: "succeeded" | "cancelled" | null;
+      // The timestamp the referencing issue reached that terminal status
+      // (issues.completedAt for "done", issues.cancelledAt for "cancelled").
+      // Required to corroborate referencingIssueTerminalStatus below — see the
+      // startedAt comparison a few lines down.
+      referencingIssueTerminalAt?: Date | null;
       // True when an active (non-terminal) issue still holds this run in a lock
       // column. The run is live for that active issue, so the caller forbids the
       // issue-terminal authority. This flag also suppresses the context-snapshot
@@ -5683,15 +5688,36 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // terminalize it.
     let issueTerminalStatus: "succeeded" | "cancelled" | null =
       options?.referencingIssueTerminalStatus ?? null;
+    let issueTerminalAt: Date | null = options?.referencingIssueTerminalAt ?? null;
     const issueId = issueIdFromRunContext(run.contextSnapshot);
     if (!issueTerminalStatus && !options?.runReferencedByActiveIssue && issueId) {
-      const issueStatus = await db
-        .select({ status: issues.status })
+      const issueRow = await db
+        .select({ status: issues.status, completedAt: issues.completedAt, cancelledAt: issues.cancelledAt })
         .from(issues)
         .where(eq(issues.id, issueId))
-        .then((rows) => rows[0]?.status ?? null);
-      if (issueStatus === "done") issueTerminalStatus = "succeeded";
-      else if (issueStatus === "cancelled") issueTerminalStatus = "cancelled";
+        .then((rows) => rows[0] ?? null);
+      if (issueRow?.status === "done") {
+        issueTerminalStatus = "succeeded";
+        issueTerminalAt = issueRow.completedAt ?? null;
+      } else if (issueRow?.status === "cancelled") {
+        issueTerminalStatus = "cancelled";
+        issueTerminalAt = issueRow.cancelledAt ?? null;
+      }
+    }
+
+    // Positive evidence, not absence of evidence (PPC-4106). A "healthy run
+    // terminalizes before or just after its issue goes terminal" only holds
+    // for the run that was live AT that transition. A run that started at or
+    // after the issue's terminal timestamp is a different, newer run — most
+    // commonly one dispatched by a wake queued off the very same terminal
+    // transition (e.g. a comment on the issue) — and is by definition not the
+    // orphan this authority exists to catch. Require run.startedAt to precede
+    // the transition; fail closed (drop this authority, fall through to the
+    // process-death check below) when either timestamp is missing, since a
+    // missing timestamp is exactly the "absence of evidence" this authority
+    // must not act on.
+    if (issueTerminalStatus && (!issueTerminalAt || !run.startedAt || run.startedAt > issueTerminalAt)) {
+      issueTerminalStatus = null;
     }
 
     // Process-death authority. The run is live only when a process still backs
@@ -5801,6 +5827,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         status: issues.status,
         checkoutRunId: issues.checkoutRunId,
         executionRunId: issues.executionRunId,
+        completedAt: issues.completedAt,
+        cancelledAt: issues.cancelledAt,
       })
       .from(issues)
       .where(
@@ -5844,6 +5872,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // "cancelled". Skip a run that an active issue also references, because that
     // run is still live for the active issue.
     const issueTerminalStatusByRunId = new Map<string, "succeeded" | "cancelled">();
+    // Timestamp the issue reached that terminal status, so
+    // terminalizeOrphanedRunningRun can require the run to predate the
+    // transition instead of terminalizing on status alone (PPC-4106).
+    const issueTerminalAtByRunId = new Map<string, Date | null>();
     for (const issue of candidates) {
       const implied =
         issue.status === "done"
@@ -5852,9 +5884,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             ? "cancelled"
             : null;
       if (!implied) continue;
+      const impliedAt = implied === "succeeded" ? issue.completedAt : issue.cancelledAt;
       for (const runId of [issue.checkoutRunId, issue.executionRunId]) {
         if (runId && !runIdsReferencedByActiveIssue.has(runId)) {
           issueTerminalStatusByRunId.set(runId, implied);
+          issueTerminalAtByRunId.set(runId, impliedAt ?? null);
         }
       }
     }
@@ -5866,6 +5900,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     for (const row of runRows) {
       const outcome = await terminalizeOrphanedRunningRun(row, {
         referencingIssueTerminalStatus: issueTerminalStatusByRunId.get(row.id) ?? null,
+        referencingIssueTerminalAt: issueTerminalAtByRunId.get(row.id) ?? null,
         runReferencedByActiveIssue: runIdsReferencedByActiveIssue.has(row.id),
       });
       runStatusById.set(row.id, outcome.status);

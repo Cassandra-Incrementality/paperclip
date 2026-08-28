@@ -1712,7 +1712,7 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
-  it("explicit same-agent resume works through the PATCH comment path", async () => {
+  it("explicit same-agent resume reopens through the PATCH comment path but never self-wakes (PPC-4106)", async () => {
     const issue = makeIssue("done");
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
@@ -1742,20 +1742,11 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
     );
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      "22222222-2222-4222-8222-222222222222",
-      expect.objectContaining({
-        reason: "issue_reopened_via_comment",
-        requestedByActorType: "agent",
-        requestedByActorId: "22222222-2222-4222-8222-222222222222",
-        payload: expect.objectContaining({
-          commentId: "comment-1",
-          reopenedFrom: "done",
-          resumeIntent: true,
-          followUpRequested: true,
-        }),
-      }),
-    );
+    // The reopen still happens (status -> todo, activity logged), but the
+    // assignee must never receive a wake for its own comment — even an
+    // explicit resume — because a self-queued wake races a second live run
+    // against this run's own in-flight terminal-status write (PPC-4106).
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("keeps generic same-agent comments on closed issues inert", async () => {
@@ -1770,7 +1761,7 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
-  it("explicit same-agent resume comments reopen closed issues and mark the wake payload", async () => {
+  it("explicit same-agent resume comments reopen closed issues but never self-wake (PPC-4106)", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue("done"),
@@ -1797,23 +1788,9 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
     );
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      "22222222-2222-4222-8222-222222222222",
-      expect.objectContaining({
-        reason: "issue_reopened_via_comment",
-        payload: expect.objectContaining({
-          commentId: "comment-1",
-          reopenedFrom: "done",
-          resumeIntent: true,
-          followUpRequested: true,
-        }),
-        contextSnapshot: expect.objectContaining({
-          wakeReason: "issue_reopened_via_comment",
-          resumeIntent: true,
-          followUpRequested: true,
-        }),
-      }),
-    );
+    // Same rationale as the PATCH comment path above: reopen without
+    // self-wake (PPC-4106).
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("honors explicit agent resume intent from a default-open peer as an agent-class wake", async () => {
@@ -2098,7 +2075,7 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
-  it("honors explicit resume intent on cancelled issues", async () => {
+  it("honors explicit resume intent on cancelled issues but does not self-wake (PPC-4106)", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("cancelled"));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue("cancelled"),
@@ -2115,14 +2092,9 @@ describe.sequential("issue comment reopen routes", () => {
       { status: "todo" },
     );
     expect(mockIssueService.addComment).toHaveBeenCalled();
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      "22222222-2222-4222-8222-222222222222",
-      expect.objectContaining({
-        requestedByActorType: "agent",
-        reason: "issue_reopened_via_comment",
-        payload: expect.objectContaining({ reopenedFrom: "cancelled", resumeIntent: true }),
-      }),
-    );
+    // Same actor is both commenter and assignee — reopen happens, self-wake
+    // does not (PPC-4106).
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("interrupts an active run before a combined comment update", async () => {
