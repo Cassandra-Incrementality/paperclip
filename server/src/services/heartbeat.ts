@@ -17031,6 +17031,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             deferredComments.length > 0 &&
             deferredComments.every((comment) => comment.createdByRunId === run.id);
         }
+
+        // The finishing run's own comment (e.g. an explicit `resume: true`
+        // follow-up) can legitimately reopen the issue and defer a wake to
+        // continue the work in a fresh run. But if that same run then
+        // re-closes the issue to done/cancelled before finishing, the
+        // deferred wake is stale: promoting it would spin up a brand-new
+        // live run to tell the agent about a comment it authored itself, on
+        // an issue it just re-closed — the manufactured-run vector behind
+        // PPC-4106. Cancel it instead of promoting when every referenced
+        // comment is self-authored, the deferred wake's target agent is the
+        // very agent that authored it (so a mention wake to a *different*
+        // agent still delivers normally), and the issue is (still, or
+        // again) terminal at promotion time; a genuinely reopened issue
+        // (still `todo`/`in_progress`/`blocked`) still promotes normally.
+        if (
+          deferredCommentIds.length > 0 &&
+          deferredCommentWakeIsSelfAuthored &&
+          deferred.agentId === run.agentId &&
+          (issue.status === "done" || issue.status === "cancelled")
+        ) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: "Deferred wake cancelled: self-authored comment's own run re-closed the issue before promotion (PPC-4106)",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
+
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
         const shouldReopenDeferredCommentWake =

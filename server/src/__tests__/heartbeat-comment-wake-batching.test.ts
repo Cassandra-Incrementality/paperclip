@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, sql } from "drizzle-orm";
 import { WebSocketServer } from "ws";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -1159,7 +1159,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     }
   }, 120_000);
 
-  it("does not reopen a finished issue when the deferred comment wake is self-authored by the closing run", async () => {
+  it("cancels a deferred comment wake instead of promoting it when self-authored by the closing run on a finished issue (PPC-4106)", async () => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -1296,17 +1296,40 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
 
       gateway.releaseFirstWait();
 
-      // The deferred wake still promotes (so the agent gets the message), but
-      // the issue must remain `done` because the only referenced comment is
-      // self-authored by the run that is now ending.
-      await waitFor(() => gateway.getAgentPayloads().length === 2, 90_000);
+      // The deferred wake must not promote into a second run (PPC-4106): the
+      // only comment behind it is self-authored by the very run that is now
+      // closing this already-done issue, so there is nothing new to act on.
+      // Neither the issue reopens nor does a second run get spawned. Wait on
+      // the deferred wake leaving `deferred_issue_execution` rather than on
+      // the first run's own status — that run finishing races the promotion
+      // transaction that actually processes the deferred wake.
+      let deferredAfterPromotion: { status: string } | null = null;
       await waitFor(async () => {
-        const runs = await db
-          .select()
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.agentId, agentId));
-        return runs.length === 2 && runs.every((run) => run.status === "succeeded");
+        deferredAfterPromotion = await db
+          .select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            ),
+          )
+          .orderBy(desc(agentWakeupRequests.requestedAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        return deferredAfterPromotion?.status !== "deferred_issue_execution";
       }, 90_000);
+
+      expect(deferredAfterPromotion?.status).toBe("cancelled");
+      expect(gateway.getAgentPayloads().length).toBe(1);
+
+      const runsAfterPromotion = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+
+      expect(runsAfterPromotion).toHaveLength(1);
 
       const issueAfterPromotion = await db
         .select({
