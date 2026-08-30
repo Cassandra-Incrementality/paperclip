@@ -1613,6 +1613,87 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(overrideNote).toBeTruthy();
   });
 
+  it("seeds hooks from the user's ~/.claude/settings.json into .claude/settings.local.json (PPC-4177: 'local' is the one settingSources scope proven to reach the spawned process)", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+    const userConfigDir = path.join(root, "user-claude-config");
+    await fs.mkdir(userConfigDir, { recursive: true });
+    const userHooks = {
+      PreToolUse: [
+        {
+          matcher: "Bash",
+          hooks: [{ type: "command", command: "/Users/jarvis/.claude/hooks/sleep-guard.sh" }],
+        },
+      ],
+    };
+    await fs.writeFile(
+      path.join(userConfigDir, "settings.json"),
+      JSON.stringify({ hooks: userHooks, permissions: { defaultMode: "default" } }, null, 2),
+      "utf8",
+    );
+
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = userConfigDir;
+    try {
+      const { meta } = await runExecutor(
+        { agent: "claude", stateDir, cwd },
+        { context: { paperclipWorkspace: { cwd } } },
+      );
+
+      const written = JSON.parse(
+        await fs.readFile(path.join(cwd, ".claude", "settings.local.json"), "utf8"),
+      ) as { hooks?: unknown };
+      expect(written.hooks).toEqual(userHooks);
+
+      const note = (meta[0]?.commandNotes as string[] | undefined)?.find((entry) =>
+        entry.includes("Paperclip-managed Claude settings"),
+      );
+      expect(note).toContain("hooks synced");
+    } finally {
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+    }
+  });
+
+  it("does not clobber a pre-existing .claude/settings.local.json hooks block with the user's settings.json hooks", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(path.join(cwd, ".claude"), { recursive: true });
+    const localHooks = { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "local-hook.sh" }] }] };
+    await fs.writeFile(
+      path.join(cwd, ".claude", "settings.local.json"),
+      JSON.stringify({ hooks: localHooks, permissions: { defaultMode: "default" } }, null, 2),
+      "utf8",
+    );
+    const userConfigDir = path.join(root, "user-claude-config");
+    await fs.mkdir(userConfigDir, { recursive: true });
+    await fs.writeFile(
+      path.join(userConfigDir, "settings.json"),
+      JSON.stringify({ hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "user-hook.sh" }] }] } }, null, 2),
+      "utf8",
+    );
+
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = userConfigDir;
+    try {
+      await runExecutor(
+        { agent: "claude", stateDir, cwd },
+        { context: { paperclipWorkspace: { cwd } } },
+      );
+
+      const written = JSON.parse(
+        await fs.readFile(path.join(cwd, ".claude", "settings.local.json"), "utf8"),
+      ) as { hooks?: unknown };
+      expect(written.hooks).toEqual(localHooks);
+    } finally {
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+    }
+  });
+
   it("opts the claude agent into ACPX runtime verbose logs but leaves codex/custom agents quiet", async () => {
     const root = await makeTempRoot();
     const cwd = path.join(root, "worktree");

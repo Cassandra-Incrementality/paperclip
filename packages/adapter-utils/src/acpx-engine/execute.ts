@@ -1218,10 +1218,43 @@ interface PaperclipClaudeSettingsResult {
   additionalDirectories: string[];
   defaultMode: string;
   overrodeDontAsk: boolean;
+  hooksSynced: boolean;
 }
 
 function uniqueSorted(values: Array<string | null | undefined>): string[] {
   return [...new Set(values.filter((value): value is string => typeof value === "string" && value.length > 0))].sort();
+}
+
+// PPC-4177: despite the comment below claiming `settingSources: ["user",
+// "project", "local"]`, the live spawn args for every observed Paperclip
+// Claude run are `--setting-sources=project,local` — "user" is silently
+// dropped somewhere between claude-agent-acp's default and the actual CLI
+// invocation. That means hooks defined only in `~/.claude/settings.json`
+// (e.g. the sleep-guard PreToolUse hook, PPC-4170) NEVER reach any
+// Paperclip-spawned Claude process, agent-health liveness routine included —
+// confirmed empirically (zero hook-fire evidence across 100+ historical
+// run-stderr logs, and a live unblocked `sleep` in an ACPX session). Read the
+// user's hooks config here and fold it into the same per-worktree
+// `settings.local.json` this function already writes, since "local" *is*
+// honored — this is the one scope proven to reach the spawned process.
+async function readUserClaudeHooksConfig(env: NodeJS.ProcessEnv): Promise<unknown | null> {
+  const configDir = (() => {
+    const fromEnv = typeof env.CLAUDE_CONFIG_DIR === "string" && env.CLAUDE_CONFIG_DIR.trim().length > 0
+      ? env.CLAUDE_CONFIG_DIR.trim()
+      : null;
+    return fromEnv ? path.resolve(fromEnv) : path.join(os.homedir(), ".claude");
+  })();
+  const raw = await fs.readFile(path.join(configDir, "settings.json"), "utf8").catch(() => null);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && parsed.hooks && typeof parsed.hooks === "object") {
+      return parsed.hooks;
+    }
+  } catch {
+    // Malformed user settings.json — skip silently, same as the local-file parse below.
+  }
+  return null;
 }
 
 // The Claude Code SDK that `claude-agent-acp` runs uses
@@ -1290,7 +1323,19 @@ async function writePaperclipClaudeSettings(input: {
     additionalDirectories: mergedAdditionalDirectories,
     defaultMode,
   };
-  const next: Record<string, unknown> = { ...existing, permissions: nextPermissions };
+  // Respect an existing local `hooks` block if one was already written (e.g.
+  // by a prior run, or hand-authored) rather than clobbering it; otherwise
+  // seed it from the user's `~/.claude/settings.json` so hooks like
+  // sleep-guard actually reach the spawned process (see PPC-4177 comment
+  // above `readUserClaudeHooksConfig`).
+  const existingHooks = existing.hooks && typeof existing.hooks === "object" ? existing.hooks : null;
+  const userHooks = existingHooks ? null : await readUserClaudeHooksConfig(process.env);
+  const nextHooks = existingHooks ?? userHooks;
+  const next: Record<string, unknown> = {
+    ...existing,
+    permissions: nextPermissions,
+    ...(nextHooks ? { hooks: nextHooks } : {}),
+  };
   await writeFileAtomically({
     target: filePath,
     contents: `${JSON.stringify(next, null, 2)}\n`,
@@ -1302,6 +1347,7 @@ async function writePaperclipClaudeSettings(input: {
     additionalDirectories: mergedAdditionalDirectories,
     defaultMode,
     overrodeDontAsk,
+    hooksSynced: Boolean(nextHooks),
   };
 }
 
@@ -1624,7 +1670,9 @@ async function buildRuntime(input: {
     skillCommandNotes.push(
       `Wrote Paperclip-managed Claude settings to ${paperclipClaudeSettings.filePath} (defaultMode=${paperclipClaudeSettings.defaultMode}${
         paperclipClaudeSettings.overrodeDontAsk ? "; overrode user dontAsk" : ""
-      }, +${paperclipClaudeSettings.additionalDirectories.length} read root(s), +${paperclipClaudeSettings.allow.length} allow rule(s)).`,
+      }, +${paperclipClaudeSettings.additionalDirectories.length} read root(s), +${paperclipClaudeSettings.allow.length} allow rule(s)${
+        paperclipClaudeSettings.hooksSynced ? "; hooks synced" : "; no hooks synced"
+      }).`,
     );
   } else if (acpxAgent === "codex") {
     // Step 2 — codex-home.seed: the codex managed-home + skills preparation.
