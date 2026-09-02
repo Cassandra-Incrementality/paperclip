@@ -5818,6 +5818,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       cleared: 0,
       issueIds: [] as string[],
       terminalizedRunIds: [] as string[],
+      orphanedDeferredWakeIds: [] as string[],
     };
 
     const candidates = await db
@@ -5963,14 +5964,66 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           referencedRunStatuses: Object.fromEntries(runStatusById),
         },
       });
+
+      // PPC-4397: `deferred_issue_execution` wakeup requests are only ever
+      // resolved by releaseIssueExecutionAndPromote's promotion loop, which this
+      // sweep does not invoke — it clears the lock columns with a direct UPDATE.
+      // A wake parked against this issue while the now-terminal run held the
+      // lock has nothing left to wait for (the issue has no lock at all once
+      // this clear commits), but the row survives with its original status. Left
+      // alone, hasActiveExecutionPath keeps reporting it as a live execution
+      // path forever, so reconcileStrandedAssignedIssues skips the issue on
+      // every tick with no explanation. Terminalize it here so the false
+      // positive clears in the same pass that orphaned it.
+      const orphanedDeferredWakes = await db
+        .update(agentWakeupRequests)
+        .set({
+          status: "failed",
+          finishedAt: new Date(),
+          error:
+            "Deferred wake orphaned: sweepStaleIssueLocks cleared this issue's execution lock with no live run left to promote it (PPC-4397)",
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, issue.companyId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${updated.id}`,
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+
+      if (orphanedDeferredWakes.length > 0) {
+        result.orphanedDeferredWakeIds.push(...orphanedDeferredWakes.map((row) => row.id));
+
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "issue.stale_deferred_wake_terminalized",
+          entityType: "issue",
+          entityId: updated.id,
+          details: {
+            source: "recovery.sweep_stale_issue_locks",
+            terminalizedWakeupRequestIds: orphanedDeferredWakes.map((row) => row.id),
+          },
+        });
+      }
     }
 
-    if (result.cleared > 0 || result.terminalizedRunIds.length > 0) {
+    if (
+      result.cleared > 0 ||
+      result.terminalizedRunIds.length > 0 ||
+      result.orphanedDeferredWakeIds.length > 0
+    ) {
       logger.warn(
         {
           cleared: result.cleared,
           issueIds: result.issueIds,
           terminalizedRunIds: result.terminalizedRunIds,
+          orphanedDeferredWakeIds: result.orphanedDeferredWakeIds,
         },
         "swept stale issue lock columns",
       );

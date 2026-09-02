@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
@@ -46,6 +47,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
@@ -692,5 +694,127 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .from(heartbeatRunEvents)
       .where(eq(heartbeatRunEvents.runId, runningRunId));
     expect(events).toEqual([]);
+  });
+
+  it("terminalizes a deferred_issue_execution wakeup request orphaned by the lock clear (PPC-4397)", async () => {
+    const { companyId, agentId, failedRunId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stale lock with an orphaned deferred wake",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionLockedAt: new Date(),
+    });
+
+    // A second agent's wake was parked against this issue while failedRunId
+    // still held the execution lock. The run died without ever reaching
+    // releaseIssueExecutionAndPromote, so nothing but this sweep will ever
+    // touch this row again.
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "Reviewer",
+      role: "reviewer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const deferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId: otherAgentId,
+      source: "automation",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      payload: { issueId },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    expect(result.orphanedDeferredWakeIds).toEqual([deferredWakeId]);
+
+    const wake = await db
+      .select({ status: agentWakeupRequests.status, error: agentWakeupRequests.error })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0]);
+    expect(wake?.status).toBe("failed");
+    expect(wake?.error).toContain("PPC-4397");
+
+    const audit = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.stale_deferred_wake_terminalized"))
+      .then((rows) => rows[0]);
+    expect(
+      (audit?.details as { terminalizedWakeupRequestIds?: string[] } | null)
+        ?.terminalizedWakeupRequestIds,
+    ).toEqual([deferredWakeId]);
+  });
+
+  it("does not touch a deferred_issue_execution wakeup request for a different issue", async () => {
+    const { companyId, agentId, failedRunId, runningRunId } = await seed();
+    const clearedIssueId = randomUUID();
+    const liveIssueId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: clearedIssueId,
+        companyId,
+        title: "Stale lock — unrelated to the live deferred wake",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: failedRunId,
+        executionRunId: failedRunId,
+        executionLockedAt: new Date(),
+      },
+      {
+        id: liveIssueId,
+        companyId,
+        title: "Still actively locked — deferred wake still legitimate",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: runningRunId,
+        executionRunId: runningRunId,
+        executionLockedAt: new Date(),
+      },
+    ]);
+
+    const deferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      payload: { issueId: liveIssueId },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(1);
+    expect(result.issueIds).toEqual([clearedIssueId]);
+    expect(result.orphanedDeferredWakeIds).toEqual([]);
+
+    const wake = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0]);
+    expect(wake?.status).toBe("deferred_issue_execution");
   });
 });
