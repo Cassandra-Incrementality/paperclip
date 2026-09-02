@@ -10689,7 +10689,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         runningProcesses.delete(run.id);
       }
 
-      const message = `Interrupted by graceful server shutdown (${signal}); retry queued for restart recovery`;
+      // PPC-4396: the terminal write below must never claim a retry that
+      // hasn't happened yet. `enqueueProcessLossRetry` is a separate awaited
+      // step (and can itself decide not to retry, e.g. agent not invokable),
+      // so the retry-promising text is only composed once we know the real
+      // outcome -- and re-persisted onto the run afterward. If the process
+      // dies before that correction lands (e.g. supervisor SIGKILL after the
+      // SIGTERM grace period), the record is left at this neutral message
+      // instead of a false promise.
+      const message = `Interrupted by graceful server shutdown (${signal})`;
       const interruptedStatus = await setRunStatusIfRunning(run.id, "interrupted", {
         finishedAt: now,
         error: message,
@@ -10724,11 +10732,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         retryRunIds.push(retry.id);
       }
 
+      const finalMessage = retry ? `${message}; retry queued for restart recovery` : `${message}; no retry queued`;
+      const corrected = await setRunStatus(interrupted.id, "interrupted", { error: finalMessage });
+      if (corrected) interrupted = corrected;
+
       await appendRunEvent(interrupted, await nextRunEventSeq(interrupted.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message,
+        message: finalMessage,
         payload: {
           signal,
           ...(run.processPid ? { processPid: run.processPid } : {}),
@@ -10737,7 +10749,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
 
-      await finalizeAgentStatus(run.agentId, "interrupted", message, {
+      await finalizeAgentStatus(run.agentId, "interrupted", finalMessage, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
       interruptedRunIds.push(interrupted.id);
@@ -13217,6 +13229,93 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     return { scanned: errorCandidates.length, cleared, clearedAgentIds };
+  }
+
+  // PPC-4396: `finalizeAgentStatus` (above) is the sole writer that clears
+  // `agents.status = "running"`. If the process dies between the run's
+  // terminal write and that finalize call (e.g. mid-drain SIGKILL, same
+  // window as the silent-strand bug this issue fixes), the agent is parked
+  // in `running` forever with nothing to reap it -- `error` has
+  // reconcileErroredAgents/reconcileStaleErrorLatches above; `running` had no
+  // equivalent. Zero live heartbeat_runs rows is the authoritative signal
+  // (unlike the error-latch case, there is no ambiguity to prove out via
+  // sibling heartbeats): if nothing is running, the status is stale by
+  // definition, regardless of *why* the finalize call was lost.
+  async function reconcileStaleRunningAgents(now: Date = new Date()): Promise<{
+    scanned: number;
+    cleared: number;
+    clearedAgentIds: string[];
+  }> {
+    const staleThresholdMs = 10 * 60 * 1000;
+    const cutoff = new Date(now.getTime() - staleThresholdMs);
+
+    const candidates = await db
+      .select({ id: agents.id, companyId: agents.companyId })
+      .from(agents)
+      .where(eq(agents.status, "running"));
+
+    let cleared = 0;
+    const clearedAgentIds: string[] = [];
+
+    for (const candidate of candidates) {
+      const runningCount = await countRunningRunsForAgent(candidate.id);
+      if (runningCount > 0) continue;
+
+      // `agents.updatedAt` is touched by unrelated bookkeeping writes (e.g.
+      // markTimerHeartbeatChecked) even while status stays "running", so it
+      // can't prove staleness on its own. Gate on the agent's own most recent
+      // heartbeat_runs row instead: zero live runs plus nothing finished
+      // recently is what actually proves the finalize call never landed.
+      const [latestRun] = await db
+        .select({ finishedAt: heartbeatRuns.finishedAt, updatedAt: heartbeatRuns.updatedAt })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, candidate.id))
+        .orderBy(desc(heartbeatRuns.createdAt))
+        .limit(1);
+      const lastActivityAt = latestRun?.finishedAt ?? latestRun?.updatedAt ?? null;
+      if (!lastActivityAt || lastActivityAt > cutoff) continue;
+
+      // Same CAS semantics as reconcileStaleErrorLatches: re-check status =
+      // 'running' at commit time so a freshly-claimed run is never clobbered.
+      const updated = await db
+        .update(agents)
+        .set({ status: "idle", updatedAt: now })
+        .where(and(eq(agents.id, candidate.id), eq(agents.status, "running")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (!updated) continue;
+
+      cleared += 1;
+      clearedAgentIds.push(candidate.id);
+
+      await logActivity(db, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: candidate.id,
+        action: "agent.running_status_reconciled",
+        entityType: "agent",
+        entityId: candidate.id,
+        details: {
+          lastRunActivityAt: lastActivityAt.toISOString(),
+          reason: "stale_running_status_zero_live_runs",
+        },
+      });
+
+      publishLiveEvent({
+        companyId: updated.companyId,
+        type: "agent.status",
+        payload: {
+          agentId: updated.id,
+          status: updated.status,
+          lastHeartbeatAt: updated.lastHeartbeatAt ? new Date(updated.lastHeartbeatAt).toISOString() : null,
+          outcome: "auto_recovered_stale_running",
+        },
+      });
+    }
+
+    return { scanned: candidates.length, cleared, clearedAgentIds };
   }
 
   function mergeRunStopMetadataForAgent(
@@ -19398,6 +19497,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     reconcileErroredAgents,
     reconcileStaleErrorLatches,
+    reconcileStaleRunningAgents,
 
     scheduleBoundedRetry: async (
       runId: string,

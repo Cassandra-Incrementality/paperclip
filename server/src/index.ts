@@ -1339,6 +1339,20 @@ export async function startServer(): Promise<StartedServer> {
               }
             })
             .then(async () => {
+              // PPC-4396: `running`'s counterpart to the error-latch sweep above --
+              // finalizeAgentStatus is the only writer that clears `running`, and a
+              // process death between a run's terminal write and that call (e.g.
+              // mid-shutdown-drain SIGKILL) parks the agent there with nothing to
+              // reap it otherwise.
+              const staleRunningRecovery = await heartbeat.reconcileStaleRunningAgents();
+              if (staleRunningRecovery.cleared > 0) {
+                logger.warn(
+                  { ...staleRunningRecovery },
+                  "periodic stale running-status sweep auto-cleared agents with zero live runs",
+                );
+              }
+            })
+            .then(async () => {
               const reconciled = await heartbeat.reconcileIssueGraphLiveness();
               if (reconciled.escalationsCreated > 0 || reconciled.dependencyWakesHealed > 0) {
                 logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
