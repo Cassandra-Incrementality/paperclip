@@ -3879,6 +3879,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             prepared,
             err,
             phase: "ensure_session",
+            now: new Date(now()),
           });
           capturedResult = {
             exitCode: 1,

@@ -160,6 +160,10 @@ function runProcessCommand(command: string, args: string[]) {
         encoding: "utf8",
         timeout: 1_500,
         windowsHide: true,
+        // `ps -o lstart=` prints a locale-formatted date; on a non-English host
+        // (e.g. it_IT: "mer 3 set 03:51:03 2026") Date.parse() rejects it and
+        // readProcessStartedAt throws. Force the C locale for the probe only.
+        env: { ...process.env, LC_ALL: "C" },
       },
       (error, stdout) => {
         if (error) reject(error);
