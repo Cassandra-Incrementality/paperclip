@@ -1691,6 +1691,15 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/agents/health-summary",
+  tags: ["agents"],
+  summary: "Summarize agent health for a company (PPC-3291 dead-agent instrumentation)",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/companies/{companyId}/agents",
   tags: ["agents"],
