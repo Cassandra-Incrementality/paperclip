@@ -52,6 +52,7 @@ type AppStatus = {
 type AppRow = {
   application: ToolApplication;
   primaryConnection: ToolConnection | null;
+  connectionCount: number;
   agentAvailableConnectionCount: number;
   status: AppStatus;
   actionCount: number;
@@ -109,7 +110,7 @@ export function Connections() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: selectedCompany?.name ?? "Company", href: "/dashboard" },
+      { label: selectedCompany?.name ?? "Organization", href: "/dashboard" },
       { label: "Apps", href: "/apps" },
       { label: "Connections" },
     ]);
@@ -218,6 +219,7 @@ export function Connections() {
       return {
         application,
         primaryConnection,
+        connectionCount: appConnections.length,
         agentAvailableConnectionCount: appConnections.filter(
           (connection) => connection.status === "active" && connection.enabled,
         ).length,
@@ -234,7 +236,7 @@ export function Connections() {
   const visibleRows = filter === "attention" ? rowsNeedingAttention : rows;
 
   if (!selectedCompanyId) {
-    return <div className="p-6 text-sm text-muted-foreground">Select a company to manage apps.</div>;
+    return <div className="p-6 text-sm text-muted-foreground">Select an organization to manage apps.</div>;
   }
 
   const loading = applicationsQuery.isLoading || connectionsQuery.isLoading || galleryQuery.isLoading;
@@ -336,10 +338,10 @@ export function Connections() {
                         ? "Paused — agents can’t use it right now."
                         : status.tone === "not_connected"
                           ? "Connect it so agents can use it."
-                        : null;
-                  const appHref = primaryConnection
-                    ? `/apps/${primaryConnection.id}`
-                    : `/apps/app/${application.id}`;
+                          : row.connectionCount > 1
+                            ? `${row.connectionCount} connections`
+                            : null;
+                  const appHref = `/apps/app/${application.id}/setup`;
                   const actionLabel = !primaryConnection
                     ? "Connect"
                     : status.tone === "attention"

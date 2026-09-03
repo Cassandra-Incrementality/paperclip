@@ -28,7 +28,7 @@ import { EntityRow } from "@/components/EntityRow";
 import { FilterBar, type FilterValue } from "@/components/FilterBar";
 import { KanbanBoard } from "@/components/KanbanBoard";
 import { LiveRunWidget } from "@/components/LiveRunWidget";
-import { CloudOnboardingFlow } from "@/components/onboarding/CloudOnboardingFlow";
+import { OnboardingWizard } from "@/components/OnboardingWizard";
 import {
   buildFileTree,
   collectAllPaths,
@@ -43,6 +43,7 @@ import { SwipeToArchive } from "@/components/SwipeToArchive";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { useDialog } from "@/context/DialogContext";
 import { queryKeys } from "@/lib/queryKeys";
 import {
   createIssue,
@@ -323,9 +324,19 @@ function LiveRunWidgetStory({ empty = false, loading = false }: { empty?: boolea
   );
 }
 
-function OnboardingStepStory({ step }: { step: "company" | "agent" }) {
-  // previewMock keeps the flow backend-free for the story canvas.
-  return <CloudOnboardingFlow initialStep={step} previewMock />;
+function OpenOnboardingOnMount({ initialStep }: { initialStep: 1 | 2 }) {
+  const { openOnboarding } = useDialog();
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    queryClient.setQueryData(queryKeys.agents.adapterModels(companyId, "claude_local"), [
+      { id: "claude-sonnet-4-5", label: "Claude Sonnet 4.5" },
+      { id: "claude-opus-4-1", label: "Claude Opus 4.1" },
+    ]);
+    openOnboarding(initialStep === 1 ? { initialStep } : { initialStep, companyId });
+  }, [initialStep, openOnboarding, queryClient]);
+
+  return <OnboardingWizard />;
 }
 
 function PackageFileTreeDemo({ empty = false }: { empty?: boolean }) {
@@ -545,10 +556,10 @@ function SwipeToArchiveDemo({ disabled = false }: { disabled?: boolean }) {
 
 function CompanyPatternIconMatrix() {
   const companies = [
-    { name: "Paperclip Storybook", color: "#0f766e" },
-    { name: "Research Bureau", color: "#2563eb" },
-    { name: "Launch Ops", color: "#c2410c" },
-    { name: "Atlas Finance", color: "#7c3aed" },
+    "Paperclip Storybook",
+    "Research Bureau",
+    "Launch Ops",
+    "Atlas Finance",
   ];
   const sizes = ["h-8 w-8 text-xs", "h-11 w-11 text-base", "h-16 w-16 text-xl", "h-24 w-24 text-3xl"];
 
@@ -556,20 +567,15 @@ function CompanyPatternIconMatrix() {
     <StoryShell>
       <Section eyebrow="CompanyPatternIcon" title="Generated company pattern icons by size">
         <div className="grid gap-4 md:grid-cols-2">
-          {companies.map((company) => (
-            <Card key={company.name} className="shadow-none">
+          {companies.map((companyName) => (
+            <Card key={companyName} className="shadow-none">
               <CardHeader>
-                <CardTitle className="text-base">{company.name}</CardTitle>
-                <CardDescription>{company.color}</CardDescription>
+                <CardTitle className="text-base">{companyName}</CardTitle>
+                <CardDescription>Hue derived from the company name</CardDescription>
               </CardHeader>
               <CardContent className="flex flex-wrap items-end gap-4">
                 {sizes.map((size) => (
-                  <CompanyPatternIcon
-                    key={size}
-                    companyName={company.name}
-                    brandColor={company.color}
-                    className={size}
-                  />
+                  <CompanyPatternIcon key={size} companyName={companyName} className={size} />
                 ))}
               </CardContent>
             </Card>
@@ -694,14 +700,14 @@ export const LiveRunWidgetEmpty: Story = {
   render: () => <LiveRunWidgetStory empty />,
 };
 
-export const OnboardingFlowCompanyStep: Story = {
-  name: "Onboarding Flow / Company Step",
-  render: () => <OnboardingStepStory step="company" />,
+export const OnboardingWizardCompanyStep: Story = {
+  name: "OnboardingWizard / Company Step",
+  render: () => <OpenOnboardingOnMount initialStep={1} />,
 };
 
-export const OnboardingFlowAgentStep: Story = {
-  name: "Onboarding Flow / Agent Step",
-  render: () => <OnboardingStepStory step="agent" />,
+export const OnboardingWizardAgentStep: Story = {
+  name: "OnboardingWizard / Agent Step",
+  render: () => <OpenOnboardingOnMount initialStep={2} />,
 };
 
 export const PackageFileTreePopulated: Story = {

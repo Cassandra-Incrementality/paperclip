@@ -119,7 +119,7 @@ export function AppDetail() {
   useEffect(() => {
     if (!activeTab) return;
     setBreadcrumbs([
-      { label: selectedCompany?.name ?? "Company", href: "/dashboard" },
+      { label: selectedCompany?.name ?? "Organization", href: "/dashboard" },
       { label: "Apps", href: "/apps" },
       { label: appName, href: appTabHref(connectionId, "setup") },
       { label: appTabLabel(activeTab) },
@@ -159,10 +159,16 @@ export function AppDetail() {
 
   const [pending, setPending] = useState(false);
   const persist = useMutation({
-    mutationFn: (next: { enabled: Set<string>; askFirst: Set<string>; access: AccessDraft }) =>
+    mutationFn: (next: {
+      enabled: Set<string>;
+      askFirst: Set<string>;
+      access: AccessDraft;
+      reviewed?: Set<string>;
+    }) =>
       toolsApi.finishApp(selectedCompanyId!, connectionId, {
         enabledCatalogEntryIds: [...next.enabled],
         askFirstCatalogEntryIds: [...next.askFirst].filter((id) => next.enabled.has(id)),
+        ...(next.reviewed ? { reviewedCatalogEntryIds: [...next.reviewed] } : {}),
         access: next.access.mode === "all" ? "all_agents" : { agentIds: [...next.access.agentIds] },
       }),
     onMutate: () => setPending(true),
@@ -317,19 +323,32 @@ export function AppDetail() {
       }),
   });
 
-  const apply = (mutate: { enabled?: Set<string>; askFirst?: Set<string>; access?: AccessDraft }) =>
+  const apply = (mutate: {
+    enabled?: Set<string>;
+    askFirst?: Set<string>;
+    access?: AccessDraft;
+    reviewed?: Set<string>;
+  }) =>
     persist.mutate({
       enabled: mutate.enabled ?? new Set(enabledIds),
       askFirst: mutate.askFirst ?? new Set(askFirstIds),
       access: mutate.access ?? access,
+      reviewed: mutate.reviewed,
     });
+
+  const reviewQuarantined = (allowedIds: string[]) => {
+    const quarantinedIds = new Set(quarantined.map((entry) => entry.id));
+    const nextEnabled = new Set([...enabledIds].filter((id) => !quarantinedIds.has(id)));
+    for (const id of allowedIds) nextEnabled.add(id);
+    apply({ enabled: nextEnabled, reviewed: quarantinedIds });
+  };
 
   if (!connectionId || !activeTab) {
     return <Navigate replace to={connectionId ? appTabHref(connectionId, "setup") : "/apps/connections"} />;
   }
 
   if (!selectedCompanyId) {
-    return <div className="p-6 text-sm text-muted-foreground">Select a company to manage apps.</div>;
+    return <div className="p-6 text-sm text-muted-foreground">Select an organization to manage apps.</div>;
   }
   if (connectionQuery.isLoading || catalogQuery.isLoading) {
     return (
@@ -411,7 +430,7 @@ export function AppDetail() {
           connectionId={connectionId}
           quarantined={quarantined}
           pending={pending}
-          onTurnOnQuarantined={(ids) => apply({ enabled: addAll(new Set(enabledIds), ids) })}
+          onReviewQuarantined={reviewQuarantined}
         />
       )}
       {activeTab === "permissions" && (
@@ -432,7 +451,7 @@ export function AppDetail() {
           onSaveInstall={(next) => persistInstall.mutate(next)}
           onRefreshActions={() => refreshTools.mutate()}
           onSetActionPermission={(id, next) => apply(actionPermissionMutation(id, next, enabledIds, askFirstIds))}
-          onTurnOnQuarantined={(ids) => apply({ enabled: addAll(new Set(enabledIds), ids) })}
+          onReviewQuarantined={reviewQuarantined}
         />
       )}
       {activeTab === "test" && (
@@ -622,12 +641,6 @@ function galleryEntryFor(
   return apps.find((app) => appDefinitionName(app).toLowerCase() === name) ??
     apps.find((app) => appDefinitionSlug(app) === name) ??
     null;
-}
-
-function addAll(set: Set<string>, ids: string[]): Set<string> {
-  const next = new Set(set);
-  for (const id of ids) next.add(id);
-  return next;
 }
 
 function actionPermissionMutation(
