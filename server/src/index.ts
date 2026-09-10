@@ -1360,6 +1360,14 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        const cancelledRunLatchRecovery = await heartbeat.reconcileCancelledRunErrorLatches();
+        if (cancelledRunLatchRecovery.cleared > 0) {
+          logger.warn(
+            { ...cancelledRunLatchRecovery },
+            "startup cancelled-run error-latch sweep auto-cleared agent errors caused by a control-plane cancel",
+          );
+        }
+
         const agentErrorRecovery = await heartbeat.reconcileErroredAgents();
         if (agentErrorRecovery.cleared > 0 || agentErrorRecovery.exhausted > 0) {
           logger.warn(
@@ -1637,6 +1645,18 @@ export async function startServer(): Promise<StartedServer> {
                 logger.warn(
                   { ...staleErrorLatchRecovery },
                   "periodic stale error-latch sweep auto-cleared provably-stale agent errors",
+                );
+              }
+            })
+            .then(async () => {
+              // Direct, single-agent proof (PPC-4933): a cancelled latest run
+              // means the error latch is a control-plane-cancel side effect,
+              // not a live fault - no cross-agent inference needed.
+              const cancelledRunLatchRecovery = await heartbeat.reconcileCancelledRunErrorLatches();
+              if (cancelledRunLatchRecovery.cleared > 0) {
+                logger.warn(
+                  { ...cancelledRunLatchRecovery },
+                  "periodic cancelled-run error-latch sweep auto-cleared agent errors caused by a control-plane cancel",
                 );
               }
             })

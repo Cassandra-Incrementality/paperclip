@@ -10959,6 +10959,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       await finalizeAgentStatus(run.agentId, "interrupted", finalMessage, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+        runId: run.id,
       });
       interruptedRunIds.push(interrupted.id);
     }
@@ -13186,7 +13187,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
     failureReason?: string | null,
-    options?: { keepIdleOnFailure?: boolean; wasFirstHeartbeat?: boolean },
+    options?: { keepIdleOnFailure?: boolean; wasFirstHeartbeat?: boolean; runId?: string },
   ) {
     const existing = await getAgent(agentId);
     if (!existing) return;
@@ -13195,13 +13196,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return;
     }
 
+    // PPC-4933: killing a run to cancel it makes the adapter's own execution
+    // promise reject with a connection_close error, which a *separate* async
+    // path (the adapter's catch handler) races to finalize as outcome="failed"
+    // against cancelRunInternal's outcome="cancelled" for the very same run.
+    // Whichever call reaches this function last wins under plain
+    // last-write-wins, and the failed-path's longer await chain usually loses
+    // that race, latching the agent into a false status=error. Re-read the
+    // run's own authoritative terminal state right before deciding nextStatus
+    // so a cancellation always wins over its own side effect, regardless of
+    // which caller happens to land last.
+    let effectiveOutcome = outcome;
+    let effectiveFailureReason = failureReason;
+    if (options?.runId && outcome !== "cancelled" && outcome !== "succeeded") {
+      const currentRun = await getRun(options.runId).catch(() => null);
+      if (currentRun && (currentRun.status === "cancelled" || currentRun.errorCode === "cancelled")) {
+        effectiveOutcome = "cancelled";
+        effectiveFailureReason = null;
+      }
+    }
+
     const isFirstHeartbeat = options?.wasFirstHeartbeat ?? !existing.lastHeartbeatAt;
 
     const runningCount = await countRunningRunsForAgent(agentId);
     const nextStatus =
       runningCount > 0
         ? "running"
-        : outcome === "succeeded" || outcome === "interrupted" || outcome === "cancelled" || (outcome === "failed" && options?.keepIdleOnFailure)
+        : effectiveOutcome === "succeeded" || effectiveOutcome === "interrupted" || effectiveOutcome === "cancelled" || (effectiveOutcome === "failed" && options?.keepIdleOnFailure)
           ? "idle"
           : "error";
 
@@ -13220,7 +13241,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Persist a human-readable reason on the agent record when it enters
         // error so operators see it on the agent page without digging into run
         // events; clear it whenever the agent leaves error.
-        errorReason: nextStatus === "error" ? truncateAgentErrorReason(failureReason) : null,
+        errorReason: nextStatus === "error" ? truncateAgentErrorReason(effectiveFailureReason) : null,
         ...(shouldResetErrorRecoveryMetadata
           ? { metadata: withoutAgentErrorRecoveryMetadata(existing.metadata) }
           : {}),
@@ -13494,6 +13515,94 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           status: updated.status,
           lastHeartbeatAt: updated.lastHeartbeatAt ? new Date(updated.lastHeartbeatAt).toISOString() : null,
           outcome: "auto_recovered_stale_latch",
+        },
+      });
+    }
+
+    return { scanned: errorCandidates.length, cleared, clearedAgentIds };
+  }
+
+  // Cancelled-run error-latch reconciler (PPC-4933, defense in depth
+  // alongside the finalizeAgentStatus race fix above). A deliberate
+  // control-plane cancel can still latch an agent into status = 'error' via
+  // paths this sweep does not directly guard (latches that predate the fix,
+  // or a future race we have not found yet) - unlike reconcileStaleErrorLatches,
+  // this needs no cross-agent inference: if the agent's OWN most recent
+  // heartbeat run ended cancelled, its error latch is definitionally benign,
+  // regardless of the errorReason text. Narrowly scoped to the agent's latest
+  // run only, so a genuine failure followed later by an unrelated cancelled
+  // run never masks it.
+  async function reconcileCancelledRunErrorLatches(now: Date = new Date()): Promise<{
+    scanned: number;
+    cleared: number;
+    clearedAgentIds: string[];
+  }> {
+    const errorCandidates = await db
+      .select({ id: agents.id, companyId: agents.companyId })
+      .from(agents)
+      .where(eq(agents.status, "error"));
+
+    if (errorCandidates.length === 0) {
+      return { scanned: 0, cleared: 0, clearedAgentIds: [] };
+    }
+
+    let cleared = 0;
+    const clearedAgentIds: string[] = [];
+
+    for (const candidate of errorCandidates) {
+      const lastRun = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, candidate.companyId), eq(heartbeatRuns.agentId, candidate.id)))
+        .orderBy(desc(heartbeatRuns.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (!lastRun || (lastRun.status !== "cancelled" && lastRun.errorCode !== "cancelled")) continue;
+
+      // Same CAS semantics as reconcileStaleErrorLatches: re-check status =
+      // 'error' at commit time so a concurrently recovering/manually-cleared/
+      // paused/terminated agent is never clobbered.
+      const updated = await db
+        .update(agents)
+        .set({
+          status: "idle",
+          pauseReason: null,
+          pausedAt: null,
+          errorReason: null,
+          updatedAt: now,
+        })
+        .where(and(eq(agents.id, candidate.id), eq(agents.status, "error")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (!updated) continue; // lost the CAS race - no-op
+
+      cleared += 1;
+      clearedAgentIds.push(candidate.id);
+
+      await logActivity(db, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: candidate.id,
+        action: "agent.error_cleared_stale_latch",
+        entityType: "agent",
+        entityId: candidate.id,
+        details: {
+          lastRunId: lastRun.id,
+          reason: "cancelled_run_error_latch_auto_clear",
+        },
+      });
+
+      publishLiveEvent({
+        companyId: updated.companyId,
+        type: "agent.status",
+        payload: {
+          agentId: updated.id,
+          status: updated.status,
+          lastHeartbeatAt: updated.lastHeartbeatAt ? new Date(updated.lastHeartbeatAt).toISOString() : null,
+          outcome: "auto_recovered_cancelled_run_latch",
         },
       });
     }
@@ -14262,6 +14371,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+        runId: run.id,
       });
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
@@ -17193,6 +17303,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ((finalizedRun ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota" : runErrorCode === "provider_quota") ||
               isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+          runId: run.id,
         },
       );
     } catch (err) {
@@ -17331,6 +17442,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(agent.id, "failed", message, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         keepIdleOnFailure: isWorkspaceSyncConflictFailure(message),
+        runId: run.id,
       });
     }
     } catch (outerErr) {
@@ -17462,6 +17574,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (setupFailureWrite.updated) {
             await finalizeAgentStatus(run.agentId, "failed", message, {
               wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+              runId: run.id,
             }).catch(() => undefined);
           }
           }
@@ -20173,6 +20286,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     reconcileErroredAgents,
     reconcileStaleErrorLatches,
+    reconcileCancelledRunErrorLatches,
     reconcileStaleRunningAgents,
 
     scheduleBoundedRetry: async (

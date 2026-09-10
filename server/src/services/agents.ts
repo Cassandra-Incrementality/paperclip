@@ -665,6 +665,21 @@ export function agentService(db: Db) {
     }
 
     const normalizedPatch = { ...data } as Partial<typeof agents.$inferInsert>;
+    // PPC-4933: a manual `PATCH {status:"idle"}` (the standard way operators
+    // clear a false-RED agent-health latch) left `errorReason` behind because
+    // this generic route just writes whatever the caller sent. Every other
+    // status-changing path here (pause/resume/clearError/terminate,
+    // finalizeAgentStatus) already clears it - do the same here so a stale
+    // reason string never survives a status change away from error, unless
+    // the caller is explicitly setting errorReason itself in the same patch.
+    if (
+      data.status !== undefined &&
+      data.status !== "error" &&
+      data.status !== existing.status &&
+      !Object.prototype.hasOwnProperty.call(data, "errorReason")
+    ) {
+      normalizedPatch.errorReason = null;
+    }
     if (data.permissions !== undefined) {
       const role = (data.role ?? existing.role) as string;
       normalizedPatch.permissions = normalizeAgentPermissions(data.permissions, role);
