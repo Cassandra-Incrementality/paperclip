@@ -103,3 +103,34 @@ export function findStaleErrorLatches(
 
   return findings;
 }
+
+export interface StaleErrorReasonResidueFinding {
+  agentId: string;
+  companyId: string;
+}
+
+/**
+ * Finds agents carrying a leftover host-auth/session errorReason string
+ * even though status is no longer 'error' (PPC-5088). This is a DIFFERENT
+ * defect shape from findStaleErrorLatches above: that function clears the
+ * *latch* (status='error') via the CAS update in the DB-touching wrapper,
+ * which only fires while status is still 'error'. If something else flips
+ * status back to 'idle'/'running'/etc WITHOUT going through that path - a
+ * status-only PATCH is the observed cause on PPC-5088, `agent.updated`
+ * activity_log row with changedTopLevelKeys:["status"] only - errorReason
+ * is left behind forever, because it is server-owned and not part of
+ * updateAgentSchema, so no ordinary write can clear it once status has
+ * already moved on. The column is inert for dispatch once status != 'error'
+ * (nothing reads it), but it is exactly the bait a liveness/health check
+ * keying on errorReason text - instead of the live status field, the thing
+ * the [agent-health] routine's own rules say to key on - will misdiagnose
+ * as a live latch, which is how PPC-5088 itself got filed against an agent
+ * that had already been idle for 18 days.
+ */
+export function findStaleErrorReasonResidue(
+  agentsList: StaleErrorLatchAgentInput[],
+): StaleErrorReasonResidueFinding[] {
+  return agentsList
+    .filter((candidate) => candidate.status !== "error" && isHostAuthSessionErrorReason(candidate.errorReason))
+    .map((candidate) => ({ agentId: candidate.id, companyId: candidate.companyId }));
+}

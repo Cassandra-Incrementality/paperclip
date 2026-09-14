@@ -33,11 +33,13 @@ export {
 } from "./service.js";
 export {
   findStaleErrorLatches,
+  findStaleErrorReasonResidue,
   isHostAuthSessionErrorReason,
 } from "./stale-error-latch.js";
 export type {
   StaleErrorLatchAgentInput,
   StaleErrorLatchFinding,
+  StaleErrorReasonResidueFinding,
 } from "./stale-error-latch.js";
 export {
   DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS,

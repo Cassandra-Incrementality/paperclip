@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -237,6 +237,7 @@ import {
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
   findStaleErrorLatches,
+  findStaleErrorReasonResidue,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
@@ -13522,6 +13523,75 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { scanned: errorCandidates.length, cleared, clearedAgentIds };
   }
 
+  // Stale errorReason residue sweep (PPC-5088). reconcileStaleErrorLatches
+  // above only clears errorReason as part of its CAS update, which requires
+  // status = 'error' at commit time - so an agent whose status was already
+  // flipped back to non-error by some OTHER path (observed cause: a
+  // status-only PATCH, e.g. a manual board fix) keeps its old errorReason
+  // string forever, since the column is server-owned and not part of
+  // updateAgentSchema. Deliberately separate from reconcileStaleErrorLatches
+  // rather than folded into its CAS: that function's precondition IS
+  // status = 'error', so it structurally cannot also cover the
+  // already-cleared case. This sweep only nulls errorReason - it never
+  // touches status, pauseReason, or pausedAt, because there is no latch left
+  // to clear, only leftover text.
+  async function reconcileStaleErrorReasonResidue(now: Date = new Date()): Promise<{
+    scanned: number;
+    cleared: number;
+    clearedAgentIds: string[];
+  }> {
+    const residueCandidates = await db
+      .select({
+        id: agents.id,
+        companyId: agents.companyId,
+        status: agents.status,
+        errorReason: agents.errorReason,
+        lastHeartbeatAt: agents.lastHeartbeatAt,
+        updatedAt: agents.updatedAt,
+      })
+      .from(agents)
+      .where(and(ne(agents.status, "error"), isNotNull(agents.errorReason)));
+
+    if (residueCandidates.length === 0) {
+      return { scanned: 0, cleared: 0, clearedAgentIds: [] };
+    }
+
+    const findings = findStaleErrorReasonResidue(residueCandidates);
+    let cleared = 0;
+    const clearedAgentIds: string[] = [];
+
+    for (const finding of findings) {
+      // Re-check status != 'error' at commit time so an agent that entered a
+      // fresh, unrelated error between the select above and this write is
+      // never clobbered - this sweep only ever nulls leftover text on an
+      // agent that is NOT currently latched.
+      const updated = await db
+        .update(agents)
+        .set({ errorReason: null, updatedAt: now })
+        .where(and(eq(agents.id, finding.agentId), ne(agents.status, "error")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (!updated) continue; // lost the race - a new error landed, no-op
+
+      cleared += 1;
+      clearedAgentIds.push(finding.agentId);
+
+      await logActivity(db, {
+        companyId: finding.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: finding.agentId,
+        action: "agent.error_reason_residue_cleared",
+        entityType: "agent",
+        entityId: finding.agentId,
+        details: { reason: "stale_error_reason_residue_clear" },
+      });
+    }
+
+    return { scanned: residueCandidates.length, cleared, clearedAgentIds };
+  }
+
   // Cancelled-run error-latch reconciler (PPC-4933, defense in depth
   // alongside the finalizeAgentStatus race fix above). A deliberate
   // control-plane cancel can still latch an agent into status = 'error' via
@@ -20286,6 +20356,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     reconcileErroredAgents,
     reconcileStaleErrorLatches,
+    reconcileStaleErrorReasonResidue,
     reconcileCancelledRunErrorLatches,
     reconcileStaleRunningAgents,
 

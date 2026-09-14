@@ -208,3 +208,143 @@ describeEmbeddedPostgres("reconcileStaleErrorLatches (PPC-4088 stale error-latch
     expect(row?.status).toBe("paused");
   });
 });
+
+describeEmbeddedPostgres("reconcileStaleErrorReasonResidue (PPC-5088 residue sweep)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("stale-error-reason-residue-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(activityLog);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  }, 60_000);
+
+  async function insertCompany() {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      status: "active",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    return companyId;
+  }
+
+  async function insertAgent(companyId: string, overrides: Partial<typeof agents.$inferInsert> = {}) {
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: overrides.name ?? "Agent",
+      role: "engineer",
+      status: "idle",
+      errorReason: null,
+      lastHeartbeatAt: null,
+      updatedAt: new Date(),
+      ...overrides,
+    });
+    return agentId;
+  }
+
+  async function getAgentRow(agentId: string) {
+    return db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
+  }
+
+  it("clears leftover errorReason left behind by a status-only PATCH (PPC-5088: Video Producer)", async () => {
+    const companyId = await insertCompany();
+    // Reproduces the exact row shape found live on PPC-5088: status flipped
+    // to idle by a status-only PATCH (activity_log changedTopLevelKeys:
+    // ["status"]) without errorReason or updatedAt moving alongside it.
+    const videoProducerId = await insertAgent(companyId, {
+      name: "Video Producer",
+      status: "idle",
+      errorReason: OAUTH_ERROR_REASON,
+      updatedAt: new Date("2026-08-28T02:04:37.244Z"),
+      lastHeartbeatAt: new Date("2026-08-26T14:07:19.117Z"),
+    });
+
+    const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+    const result = await heartbeat.reconcileStaleErrorReasonResidue(new Date("2026-09-14T12:09:00.000Z"));
+
+    expect(result).toMatchObject({ scanned: 1, cleared: 1 });
+    expect(result.clearedAgentIds).toEqual([videoProducerId]);
+
+    const row = await getAgentRow(videoProducerId);
+    expect(row?.status).toBe("idle"); // untouched - there was no latch, only text
+    expect(row?.errorReason).toBeNull();
+  });
+
+  it("does not touch an agent that is still genuinely latched in status='error'", async () => {
+    const companyId = await insertCompany();
+    const victimId = await insertAgent(companyId, {
+      name: "Data Scientist 3",
+      status: "error",
+      errorReason: OAUTH_ERROR_REASON,
+      updatedAt: new Date("2026-08-26T22:51:00.000Z"),
+    });
+
+    const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+    const result = await heartbeat.reconcileStaleErrorReasonResidue(new Date("2026-08-28T03:00:00.000Z"));
+
+    expect(result).toMatchObject({ scanned: 0, cleared: 0 });
+    const row = await getAgentRow(victimId);
+    expect(row?.errorReason).toBe(OAUTH_ERROR_REASON);
+  });
+
+  it("does not scan an agent that has already moved to status='error' before the sweep's select", async () => {
+    const companyId = await insertCompany();
+    const agentId = await insertAgent(companyId, {
+      name: "Video Producer",
+      status: "idle",
+      errorReason: OAUTH_ERROR_REASON,
+      updatedAt: new Date("2026-08-28T02:04:37.244Z"),
+    });
+
+    // A brand-new, unrelated error lands before the sweep ever runs.
+    await db
+      .update(agents)
+      .set({ status: "error", errorReason: "adapter execution timeout (timeoutSec=1000)" })
+      .where(eq(agents.id, agentId));
+
+    const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+    const result = await heartbeat.reconcileStaleErrorReasonResidue(new Date("2026-09-14T12:09:00.000Z"));
+
+    expect(result).toMatchObject({ scanned: 0, cleared: 0 });
+    const row = await getAgentRow(agentId);
+    expect(row?.status).toBe("error");
+    expect(row?.errorReason).toBe("adapter execution timeout (timeoutSec=1000)");
+  });
+
+  it("is idempotent under concurrent invocation (CAS covers double-clearing)", async () => {
+    const companyId = await insertCompany();
+    const agentId = await insertAgent(companyId, {
+      name: "Video Producer",
+      status: "idle",
+      errorReason: OAUTH_ERROR_REASON,
+      updatedAt: new Date("2026-08-28T02:04:37.244Z"),
+    });
+
+    const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+    const now = new Date("2026-09-14T12:09:00.000Z");
+
+    const [first, second] = await Promise.all([
+      heartbeat.reconcileStaleErrorReasonResidue(now),
+      heartbeat.reconcileStaleErrorReasonResidue(now),
+    ]);
+
+    expect(first.cleared + second.cleared).toBe(1);
+    const row = await getAgentRow(agentId);
+    expect(row?.errorReason).toBeNull();
+  });
+});

@@ -1360,6 +1360,14 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        const staleErrorReasonResidueRecovery = await heartbeat.reconcileStaleErrorReasonResidue();
+        if (staleErrorReasonResidueRecovery.cleared > 0) {
+          logger.warn(
+            { ...staleErrorReasonResidueRecovery },
+            "startup stale error-reason residue sweep cleared leftover errorReason text on non-errored agents",
+          );
+        }
+
         const cancelledRunLatchRecovery = await heartbeat.reconcileCancelledRunErrorLatches();
         if (cancelledRunLatchRecovery.cleared > 0) {
           logger.warn(
@@ -1645,6 +1653,19 @@ export async function startServer(): Promise<StartedServer> {
                 logger.warn(
                   { ...staleErrorLatchRecovery },
                   "periodic stale error-latch sweep auto-cleared provably-stale agent errors",
+                );
+              }
+            })
+            .then(async () => {
+              // Leftover errorReason text on an agent whose status already
+              // moved past 'error' via some other path (PPC-5088) - see
+              // reconcileStaleErrorReasonResidue for why this cannot be
+              // folded into the sweep above.
+              const staleErrorReasonResidueRecovery = await heartbeat.reconcileStaleErrorReasonResidue();
+              if (staleErrorReasonResidueRecovery.cleared > 0) {
+                logger.warn(
+                  { ...staleErrorReasonResidueRecovery },
+                  "periodic stale error-reason residue sweep cleared leftover errorReason text on non-errored agents",
                 );
               }
             })

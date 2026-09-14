@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   findStaleErrorLatches,
+  findStaleErrorReasonResidue,
   isHostAuthSessionErrorReason,
   type StaleErrorLatchAgentInput,
 } from "./stale-error-latch.js";
@@ -170,5 +171,62 @@ describe("findStaleErrorLatches", () => {
 
     const findings = findStaleErrorLatches(agents, NOW);
     expect(findings.map((f) => f.agentId).sort()).toEqual(["victim-a", "victim-b"]);
+  });
+});
+
+describe("findStaleErrorReasonResidue", () => {
+  it("flags a non-errored agent still carrying a host-auth errorReason (PPC-5088 shape)", () => {
+    const agents = [
+      agent({
+        id: "video-producer",
+        status: "idle",
+        errorReason: "Internal error: Failed to authenticate: OAuth session expired and could not be refreshed",
+      }),
+    ];
+
+    const findings = findStaleErrorReasonResidue(agents);
+    expect(findings).toEqual([{ agentId: "video-producer", companyId: "company-1" }]);
+  });
+
+  it("does not flag an agent that is still genuinely errored", () => {
+    const agents = [
+      agent({
+        id: "still-latched",
+        status: "error",
+        errorReason: "OAuth session expired and could not be refreshed",
+      }),
+    ];
+
+    expect(findStaleErrorReasonResidue(agents)).toHaveLength(0);
+  });
+
+  it("does not flag a non-errored agent with no errorReason", () => {
+    const agents = [agent({ id: "clean", status: "idle", errorReason: null })];
+
+    expect(findStaleErrorReasonResidue(agents)).toHaveLength(0);
+  });
+
+  it("does not flag a non-errored agent whose leftover errorReason is an unrelated failure", () => {
+    const agents = [
+      agent({
+        id: "unrelated",
+        status: "idle",
+        errorReason: "adapter execution timeout (timeoutSec=1000)",
+      }),
+    ];
+
+    expect(findStaleErrorReasonResidue(agents)).toHaveLength(0);
+  });
+
+  it("flags a 'running' agent with residue too, not just 'idle'", () => {
+    const agents = [
+      agent({
+        id: "mid-run",
+        status: "running",
+        errorReason: "token expired, please re-login",
+      }),
+    ];
+
+    expect(findStaleErrorReasonResidue(agents)).toEqual([{ agentId: "mid-run", companyId: "company-1" }]);
   });
 });
