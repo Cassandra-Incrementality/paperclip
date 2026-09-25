@@ -68,6 +68,19 @@ type TransitionResult = {
  */
 export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
 
+/**
+ * Backstop reschedule interval applied when a monitor is triggered (PPC-5376).
+ * Firing a wakeup used to null out monitorNextCheckAt and leave the monitor's
+ * fate entirely to the woken run explicitly rescheduling or clearing it
+ * before exiting; a run that dies first stranded the issue with no wake path
+ * forever, even though executionState.monitor still read "triggered" and
+ * unexpired. Rescheduling a guard check here means the very next tick either
+ * re-dispatches (run just hasn't gotten to it yet) or runs the existing
+ * exhaustion/clear-and-recover path (issueMonitorLimitClearReason) — no new
+ * state machine, just making sure *something* always re-examines it.
+ */
+export const ISSUE_MONITOR_TRIGGERED_GUARD_INTERVAL_MS = 30 * 60 * 1000;
+
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
 const PENDING_STATUS: IssueExecutionState["status"] = "pending";
 const CHANGES_REQUESTED_STATUS: IssueExecutionState["status"] = "changes_requested";
@@ -230,10 +243,15 @@ function buildScheduledMonitorState(
 function buildTriggeredMonitorState(input: {
   previous: IssueExecutionMonitorState | null;
   triggeredAt: Date;
+  guardNextCheckAt: string;
 }): IssueExecutionMonitorState {
   return {
-    status: "triggered",
-    nextCheckAt: null,
+    // nextCheckAt non-null means "scheduled" everywhere else this state is
+    // derived (see derivePersistedMonitorState) — labeling it "triggered"
+    // here while a real nextCheckAt is set would just be a state that
+    // re-derives differently than it was written.
+    status: "scheduled",
+    nextCheckAt: input.guardNextCheckAt,
     lastTriggeredAt: input.triggeredAt.toISOString(),
     attemptCount: (input.previous?.attemptCount ?? 0) + 1,
     notes: input.previous?.notes ?? null,
@@ -1171,15 +1189,19 @@ export function buildIssueMonitorTriggeredPatch(input: {
     state: existingState,
     policy: input.policy,
   });
+  const guardNextCheckAt = new Date(
+    input.triggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_GUARD_INTERVAL_MS,
+  ).toISOString();
   const nextMonitorState = buildTriggeredMonitorState({
     previous: currentMonitorState,
     triggeredAt: input.triggeredAt,
+    guardNextCheckAt,
   });
 
   return {
     executionPolicy: stripMonitorFromExecutionPolicy(input.policy) as Record<string, unknown> | null,
     executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
-    monitorNextCheckAt: null,
+    monitorNextCheckAt: new Date(guardNextCheckAt),
     monitorWakeRequestedAt: null,
     monitorLastTriggeredAt: input.triggeredAt,
     monitorAttemptCount: nextMonitorState.attemptCount,

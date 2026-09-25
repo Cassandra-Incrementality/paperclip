@@ -25,7 +25,11 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
-import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import {
+  ISSUE_MONITOR_TRIGGERED_GUARD_INTERVAL_MS,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+} from "../services/issue-execution-policy.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -236,7 +240,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     return { companyId, agentId, issueId, nextCheckAt };
   }
 
-  it("triggers due issue monitors once and clears the one-shot schedule", async () => {
+  it("triggers due issue monitors once and reschedules a guard check (PPC-5376)", async () => {
     const { issueId, agentId } = await seedFixture();
     const heartbeat = heartbeatService(db);
     const tickAt = new Date("2026-04-11T12:31:00.000Z");
@@ -246,12 +250,14 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(result.enqueued).toBe(1);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
-    expect(issue.monitorNextCheckAt).toBeNull();
+    const expectedGuardNextCheckAt = new Date(tickAt.getTime() + ISSUE_MONITOR_TRIGGERED_GUARD_INTERVAL_MS);
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe(expectedGuardNextCheckAt.toISOString());
     expect(issue.monitorAttemptCount).toBe(1);
     expect(issue.monitorLastTriggeredAt?.toISOString()).toBe(tickAt.toISOString());
     expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor ?? null).toBeNull();
     expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
-      status: "triggered",
+      status: "scheduled",
+      nextCheckAt: expectedGuardNextCheckAt.toISOString(),
       lastTriggeredAt: tickAt.toISOString(),
       attemptCount: 1,
     });
@@ -352,7 +358,9 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(result.outcome).toBe("triggered");
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
-    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe(
+      new Date(triggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_GUARD_INTERVAL_MS).toISOString(),
+    );
     expect(issue.monitorLastTriggeredAt?.toISOString()).toBe(triggeredAt.toISOString());
     expect(issue.monitorAttemptCount).toBe(1);
     expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor ?? null).toBeNull();
