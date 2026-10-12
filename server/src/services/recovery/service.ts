@@ -10,6 +10,7 @@ import {
   type IssueCommentPresentation,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type IssueUnblockDescriptor,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -3233,9 +3234,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    // PPC-6171: this call bypasses the API-layer guard in routes.ts ("Entering
+    // blocked requires unresolved blockers, a pending interaction/approval, or
+    // unblockDescriptor") because it goes straight through the service, not the
+    // route. Left to default, that produced exactly the dead end the API guard
+    // exists to prevent: blocked, zero blockers, null unblockDescriptor. The
+    // recovery action we just ensured already carries a real owner/action pair —
+    // mirror it onto the issue itself so the board sees something actionable
+    // instead of a silent dead end.
+    const unblockDescriptor: IssueUnblockDescriptor | null = blockerIds.length === 0 &&
+      input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+      ? {
+        owner: recoveryAction.ownerAgentId ? { agentId: recoveryAction.ownerAgentId } : "board",
+        action: recoveryAction.nextAction,
+      }
+      : null;
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
+      ...(unblockDescriptor ? { unblockDescriptor } : {}),
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
@@ -4122,6 +4139,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
         if (!handoffEvidence.exhausted) {
+          result.skipped += 1;
+          continue;
+        }
+
+        // PPC-6171: the assignee stating in plain English that it is still
+        // working (most often on backgrounded work) is the exact signal this
+        // guard should respect, the same way isRepeatedProductiveContinuationRecovery
+        // already does below for ordinary stranded continuations. Without this,
+        // handoffAttempt/maxHandoffAttempts both default to 1, so the corrective
+        // handoff wake reads as "exhausted" on its very first check and escalates
+        // immediately after whatever comment the agent just posted.
+        const exemptedByRecentProgress = await hasRecentVisibleProgress(
+          issue.companyId,
+          issue.id,
+          agentId,
+          STRANDED_RECENT_PROGRESS_EXEMPTION_MS,
+        );
+        if (exemptedByRecentProgress) {
+          result.recentProgressExempted += 1;
           result.skipped += 1;
           continue;
         }

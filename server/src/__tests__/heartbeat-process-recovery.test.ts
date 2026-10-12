@@ -4014,6 +4014,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(sourceIssue?.status).toBe("blocked");
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+    // PPC-6171: with zero first-class blockers, the issue must not land blocked
+    // with a null unblockDescriptor and no card — mirror the recovery action's
+    // owner/action onto the issue itself.
+    expect(sourceIssue?.unblockDescriptor).toMatchObject({
+      owner: "board",
+      action: expect.stringContaining("Board operator"),
+    });
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments[0]?.body).toBe(SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY);
@@ -4096,6 +4103,97 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       latestRunStatus: "succeeded",
       missingDisposition: "clear_next_step",
     });
+  });
+
+  it("exempts missing-disposition escalation when the assignee posted a recent comment (PPC-6171)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    // The assignee stated it is still working on backgrounded work. That should
+    // reset the disposition clock the same way a recent comment already does
+    // for the ordinary stranded-continuation path (GGU-809).
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      body: "still running in the background -- I'll pick back up once it finishes.",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.recentProgressExempted).toBe(1);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("in_progress");
+    expect(sourceIssue?.unblockDescriptor).toBeNull();
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body === SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY)).toBe(false);
+  });
+
+  it("still escalates missing-disposition when the recent comment is older than the exemption window (PPC-6171)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const stale = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      body: "old progress note",
+      createdAt: stale,
+      updatedAt: stale,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffEscalated).toBe(1);
+    expect(result.recentProgressExempted).toBe(0);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("blocked");
+    expect(sourceIssue?.unblockDescriptor).toMatchObject({ owner: "board" });
   });
 
   it("converts a continuation parked for review into a dependency wait on its open sub-tasks", async () => {
