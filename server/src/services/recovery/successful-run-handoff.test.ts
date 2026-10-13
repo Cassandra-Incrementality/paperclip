@@ -301,6 +301,31 @@ describe("successful run handoff decision", () => {
     expect(isSuccessfulRunHandoffValidPathSkip(decide({ hasActiveExecutionPath: true }))).toBe(true);
     expect(isSuccessfulRunHandoffValidPathSkip(decide({ hasQueuedWake: true }))).toBe(true);
     expect(isSuccessfulRunHandoffValidPathSkip(decide({ budgetBlocked: true }))).toBe(false);
+    expect(isSuccessfulRunHandoffValidPathSkip(decide({ nextAction: "Still running in the background." }))).toBe(true);
+  });
+
+  it("does not post the stage-1 missing-disposition notice when the assignee's own report states an in-flight continuation (PPC-6222)", () => {
+    expect(decide({ nextAction: "still running in the background -- I'll pick back up once it finishes." })).toEqual({
+      kind: "skip",
+      reason: "assignee's own report states an in-flight continuation",
+    });
+    expect(decide({ finalReport: "Kicked off the long migration; it is still running in the background." })).toEqual({
+      kind: "skip",
+      reason: "assignee's own report states an in-flight continuation",
+    });
+    expect(decide({ detectedProgressSummary: "Run produced concrete action evidence: still running in the background" }))
+      .toEqual({
+        kind: "skip",
+        reason: "assignee's own report states an in-flight continuation",
+      });
+  });
+
+  it("still fires the stage-1 notice for an ordinary completion report with no stated continuation (PPC-6222 regression)", () => {
+    const decision = decide({
+      finalReport: "Implemented the backend detector, but did not choose a final issue state.",
+      nextAction: "Record the correct issue disposition.",
+    });
+    expect(decision.kind).toBe("enqueue");
   });
 
   it("does not treat killed background-task evidence as a missing live path when a durable monitor owns the wait", () => {

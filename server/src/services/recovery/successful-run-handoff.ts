@@ -132,6 +132,7 @@ const SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS = new Set([
   "open recovery issue owns the ambiguity",
   "issue is under an active pause hold",
   "corrective handoff wake already exists for this source run",
+  "assignee's own report states an in-flight continuation",
 ]);
 
 export function isSuccessfulRunHandoffValidPathSkip(
@@ -360,6 +361,36 @@ function isProductiveSuccessfulRun(input: {
   return Boolean(input.detectedProgressSummary);
 }
 
+// PPC-6222: a narrow, conservative phrase match for the assignee's own run
+// output stating an in-flight continuation (e.g. "still running in the
+// background, I'll pick back up"), the same shape of signal PPC-6171 added
+// for the stage-2 escalation path (hasRecentVisibleProgress in
+// recovery/service.ts). It is NOT a comment-recency/presence check: this
+// function fires the very first time a successful run leaves an issue without
+// a disposition, and at that point the run's own completion summary has
+// almost always just been posted as a comment, so "a recent assignee comment
+// exists" is true on nearly every firing and would silence the notice
+// unconditionally (verified against heartbeat-process-recovery.test.ts: it
+// broke the baseline "queues one finish-handoff wake..." case and the
+// secret-redaction case, both of which still expect the notice to fire for an
+// ordinary completion report). Matching on stated intent in the run's own
+// text — rather than on the mere existence of recent activity — is the
+// signal that actually discriminates "still working" from "finished without a
+// disposition".
+const STATED_IN_FLIGHT_CONTINUATION_RE =
+  /\b(?:still\s+(?:running|working|in\s+progress|continuing)|running\s+in\s+the\s+background|continu\w*\s+(?:in|running)\s+the\s+background|pick(?:ing)?\s+(?:this\s+|it\s+)?back\s+up|resum\w*\s+(?:this|it|work)\b)/i;
+
+function statesInFlightContinuation(input: {
+  finalReport: string | null;
+  nextAction: string | null;
+  detectedProgressSummary: string | null;
+}) {
+  const text = [input.finalReport, input.nextAction, input.detectedProgressSummary]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join("\n");
+  return text.length > 0 && STATED_IN_FLIGHT_CONTINUATION_RE.test(text);
+}
+
 export function buildSuccessfulRunHandoffInstruction(input: {
   issueIdentifier: string | null;
   issueTitle: string;
@@ -497,6 +528,13 @@ export function decideSuccessfulRunHandoff(input: {
   if (input.budgetBlocked) return { kind: "skip", reason: "budget hard stop blocks corrective wake" };
   if (input.idempotentWakeExists) {
     return { kind: "skip", reason: "corrective handoff wake already exists for this source run" };
+  }
+  if (statesInFlightContinuation({
+    finalReport: input.finalReport,
+    nextAction: input.nextAction,
+    detectedProgressSummary: input.detectedProgressSummary,
+  })) {
+    return { kind: "skip", reason: "assignee's own report states an in-flight continuation" };
   }
 
   const instruction = buildSuccessfulRunHandoffInstruction({
