@@ -61,6 +61,7 @@ import {
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildSuccessfulRunHandoffExhaustedNotice,
+  isLiveDeclaredStatus,
   isPluginManagedIssueLifecycle,
   noticeMetadataReferencesRecoveryAction,
   type SuccessfulRunHandoffNotice,
@@ -1046,6 +1047,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .then((rows) => rows[0] ?? null),
     ]);
     return Boolean(comment || attachment);
+  }
+
+  // PPC-6171: read the assignee's own most recent comment for a declared live
+  // disposition (`**Status:** on-track`, etc) rather than relying on a recency
+  // window -- see the rationale on isLiveDeclaredStatus. Unlike
+  // hasRecentVisibleProgress, this is intentionally not time-bounded: a
+  // declared disposition is a stronger signal than how long ago it was typed.
+  async function hasDeclaredLiveStatus(companyId: string, issueId: string, assigneeAgentId: string) {
+    const [latestComment] = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, companyId),
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.authorAgentId, assigneeAgentId),
+        ),
+      )
+      .orderBy(desc(issueComments.createdAt))
+      .limit(1);
+    return isLiveDeclaredStatus(latestComment?.body);
   }
 
   async function enqueueStrandedIssueRecovery(input: {
@@ -3249,11 +3271,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         action: recoveryAction.nextAction,
       }
       : null;
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: blockerIds,
-      ...(unblockDescriptor ? { unblockDescriptor } : {}),
-    });
+    // PPC-6171: for the missing-disposition cause with zero first-class
+    // blockers and no real recovery-action owner, the only descriptor above
+    // is always the generic "board" / "Board operator: inspect the run
+    // evidence..." boilerplate -- a dead end that reads as actionable but
+    // names nothing anyone can do. Writing `blocked` with that descriptor is
+    // strictly worse than leaving the issue alone, because `blocked` stops
+    // the owner's own heartbeat from waking it. Leave status untouched and
+    // let the notice below carry the information instead.
+    const noActionableOwnerForMissingDisposition = blockerIds.length === 0 &&
+      input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON &&
+      !recoveryAction.ownerAgentId;
+    const updated = noActionableOwnerForMissingDisposition
+      ? input.issue
+      : await issuesSvc.update(input.issue.id, {
+        status: "blocked",
+        blockedByIssueIds: blockerIds,
+        ...(unblockDescriptor ? { unblockDescriptor } : {}),
+      });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
     const sourceAssigneePreserved =
@@ -3291,6 +3326,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         latestIssueStatus: input.issue.status,
         latestHandoffRunStatus: input.latestRun?.status ?? "unknown",
         missingDisposition: input.successfulRunHandoffEvidence.missingDisposition,
+        issueLeftInProgress: noActionableOwnerForMissingDisposition,
       });
     }
     const escalationNotice = buildStrandedRecoveryEscalationNotice({
@@ -3365,7 +3401,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       entityId: input.issue.id,
       details: {
         identifier: input.issue.identifier,
-        status: "blocked",
+        status: updated.status,
         previousStatus: input.previousStatus,
         source: input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
           ? "recovery.reconcile_successful_run_handoff_missing_state"
@@ -3584,6 +3620,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       waitingOnReviewResolved: 0,
       providerQuotaMonitored: 0,
       recentProgressExempted: 0,
+      declaredLiveStatusExempted: 0,
+      routineExecutionOriginExempted: 0,
+      successfulRunHandoffNotifiedWithoutBlocking: 0,
       operatorCancelExempted: 0,
       skipped: 0,
       issueIds: [] as string[],
@@ -4143,6 +4182,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        // PPC-6171: a routine-execution carrier is re-minted fresh on every
+        // run and the routine never revisits yesterday's issue -- escalating
+        // or blocking one is permanent litter nobody will ever act on.
+        if (issue.originKind === "routine_execution") {
+          result.routineExecutionOriginExempted += 1;
+          result.skipped += 1;
+          continue;
+        }
+
+        // PPC-6171: the assignee's own most recent comment already declares a
+        // live disposition (e.g. `**Status:** on-track`) -- trust that over
+        // elapsed time. 27 of 28 historical firings landed within 2m35s of
+        // such a comment, but the one that caused real damage (PPC-6289)
+        // landed 30m05s later, past any recency window short enough to not
+        // also mask genuinely stuck issues. Safe here (unlike at stage-1,
+        // see PPC-6222) because handoffEvidence.exhausted already filtered
+        // out every run that picked a real disposition.
+        const declaredLiveStatus = await hasDeclaredLiveStatus(issue.companyId, issue.id, agentId);
+        if (declaredLiveStatus) {
+          result.declaredLiveStatusExempted += 1;
+          result.skipped += 1;
+          continue;
+        }
+
         // PPC-6171: the assignee stating in plain English that it is still
         // working (most often on backgrounded work) is the exact signal this
         // guard should respect, the same way isRepeatedProductiveContinuationRecovery
@@ -4170,7 +4233,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           successfulRunHandoffEvidence: handoffEvidence,
         });
         if (updated) {
-          result.successfulRunHandoffEscalated += 1;
+          if (updated.status === "blocked") {
+            result.successfulRunHandoffEscalated += 1;
+          } else {
+            // PPC-6171: no first-class blocker and no real recovery-action
+            // owner -- the only descriptor we could write is the generic
+            // "Board operator: inspect..." boilerplate. Blocking an in-flight
+            // issue on that is strictly worse than leaving it alone, since
+            // `blocked` stops the owner's own heartbeat from waking it.
+            // escalateStrandedAssignedIssue left status untouched and posted
+            // the notice as information only.
+            result.successfulRunHandoffNotifiedWithoutBlocking += 1;
+          }
           result.issueIds.push(issue.id);
         } else {
           result.skipped += 1;

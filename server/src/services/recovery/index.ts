@@ -66,9 +66,11 @@ export {
   buildSuccessfulRunHandoffRequiredNotice,
   decideSuccessfulRunHandoff,
   findExistingFinishSuccessfulRunHandoffWake,
+  isLiveDeclaredStatus,
   isSuccessfulRunHandoffValidPathSkip,
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
+  parseDeclaredStatus,
 } from "./successful-run-handoff.js";
 export type {
   SuccessfulRunHandoffNotice,

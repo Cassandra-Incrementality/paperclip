@@ -1005,6 +1005,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     kind?: string;
     previousOwnerAgentId?: string | null;
     returnOwnerAgentId?: string | null;
+    expectedIssueStatus?: "blocked" | "in_progress";
   }) {
     const action = await waitForValue(async () =>
       db.select().from(issueRecoveryActions).where(
@@ -1067,7 +1068,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issues)
       .where(eq(issues.id, input.issueId))
       .then((rows) => rows[0] ?? null);
-    expect(sourceIssue?.status).toBe("blocked");
+    expect(sourceIssue?.status).toBe(input.expectedIssueStatus ?? "blocked");
 
     return action;
   }
@@ -3989,7 +3990,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const result = await heartbeat.reconcileStrandedAssignedIssues();
     expect(result.continuationRequeued).toBe(0);
     expect(result.escalated).toBe(0);
-    expect(result.successfulRunHandoffEscalated).toBe(1);
+    // PPC-6171: with zero first-class blockers and no real recovery-action
+    // owner, the only descriptor available is the generic "board" boilerplate
+    // -- the issue is left in_progress and notified instead of blocked on it.
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.successfulRunHandoffNotifiedWithoutBlocking).toBe(1);
     expect(result.issueIds).toEqual([issueId]);
 
     const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
@@ -4001,6 +4006,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: null,
       cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
       kind: "missing_disposition",
+      // PPC-6171: no first-class blockers and no real recovery-action owner
+      // -- the issue is left in_progress and notified instead of blocked.
+      expectedIssueStatus: "in_progress",
     });
     expect(recoveryAction.evidence).toMatchObject({
       sourceRunId,
@@ -4012,18 +4020,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(JSON.stringify(recoveryAction.evidence)).not.toContain("sk-test-successful-handoff-secret");
 
     const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(sourceIssue?.status).toBe("blocked");
+    expect(sourceIssue?.status).toBe("in_progress");
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
-    // PPC-6171: with zero first-class blockers, the issue must not land blocked
-    // with a null unblockDescriptor and no card — mirror the recovery action's
-    // owner/action onto the issue itself.
-    expect(sourceIssue?.unblockDescriptor).toMatchObject({
-      owner: "board",
-      action: expect.stringContaining("Board operator"),
-    });
+    // PPC-6171: with no real recovery-action owner, the issue must not land
+    // blocked with the generic "board" descriptor nobody can act on.
+    expect(sourceIssue?.unblockDescriptor).toBeNull();
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments[0]?.body).toBe(SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY);
+    expect(comments[0]?.body).toContain("board decision is required");
     expect(comments[0]?.authorType).toBe("system");
     expect(comments[0]?.presentation).toMatchObject({
       kind: "system_notice",
@@ -4086,7 +4090,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const result = await heartbeat.reconcileStrandedAssignedIssues();
     expect(result.continuationRequeued).toBe(0);
     expect(result.successfulContinuationObserved).toBe(0);
-    expect(result.successfulRunHandoffEscalated).toBe(1);
+    // PPC-6171: with zero first-class blockers and no real recovery-action
+    // owner, the only descriptor available is the generic "board" boilerplate
+    // -- the issue is left in_progress and notified instead of blocked on it.
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.successfulRunHandoffNotifiedWithoutBlocking).toBe(1);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("in_progress");
+    expect(sourceIssue?.unblockDescriptor).toBeNull();
 
     const recoveryAction = await expectSourceScopedStrandedRecoveryAction({
       companyId,
@@ -4097,12 +4109,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: null,
       cause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
       kind: "missing_disposition",
+      // PPC-6171: no first-class blockers and no real recovery-action owner
+      // -- the issue is left in_progress and notified instead of blocked.
+      expectedIssueStatus: "in_progress",
     });
     expect(recoveryAction.evidence).toMatchObject({
       sourceRunId,
       latestRunStatus: "succeeded",
       missingDisposition: "clear_next_step",
     });
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments[0]?.body).toContain("board decision is required");
   });
 
   it("exempts missing-disposition escalation when the assignee posted a recent comment (PPC-6171)", async () => {
@@ -4152,7 +4170,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments.some((comment) => comment.body === SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY)).toBe(false);
   });
 
-  it("still escalates missing-disposition when the recent comment is older than the exemption window (PPC-6171)", async () => {
+  it("still notifies (without blocking) when the stale comment has no declared live status (PPC-6171)", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "succeeded",
@@ -4188,12 +4206,117 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
-    expect(result.successfulRunHandoffEscalated).toBe(1);
+    // PPC-6171: a stale, undeclared comment doesn't exempt the issue (it's not
+    // a live status and it's outside the recent-progress window), but with no
+    // real recovery-action owner the escalation still can't justify a blocked
+    // transition -- it notifies and leaves the issue in_progress.
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.successfulRunHandoffNotifiedWithoutBlocking).toBe(1);
     expect(result.recentProgressExempted).toBe(0);
+    expect(result.declaredLiveStatusExempted).toBe(0);
+    expect(result.routineExecutionOriginExempted).toBe(0);
 
     const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(sourceIssue?.status).toBe("blocked");
-    expect(sourceIssue?.unblockDescriptor).toMatchObject({ owner: "board" });
+    expect(sourceIssue?.status).toBe("in_progress");
+    expect(sourceIssue?.unblockDescriptor).toBeNull();
+  });
+
+  it("exempts missing-disposition escalation when the assignee's latest comment declares a live status, regardless of age (PPC-6171)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    // PPC-6171: PPC-6289's damaging firing landed 30m05s after the assignee's
+    // last comment -- past any recency window short enough to not also mask
+    // genuinely stuck issues. A declared live status must suppress regardless
+    // of how long ago it was posted.
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      body: "**Status:** on-track\n**Needs you:** Nothing.",
+      createdAt: old,
+      updatedAt: old,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.successfulRunHandoffNotifiedWithoutBlocking).toBe(0);
+    expect(result.declaredLiveStatusExempted).toBe(1);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("in_progress");
+    expect(sourceIssue?.unblockDescriptor).toBeNull();
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body?.includes("board decision is required"))).toBe(false);
+  });
+
+  it("exempts missing-disposition escalation entirely for a routine-execution origin issue (PPC-6171)", async () => {
+    const { issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    await db
+      .update(issues)
+      .set({ originKind: "routine_execution" })
+      .where(eq(issues.id, issueId));
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    // PPC-6171: a routine carrier is re-minted fresh every run and the
+    // routine never revisits yesterday's issue -- 3 of the 9 still-blocked
+    // issues from this guard were exactly this kind of permanent litter.
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.successfulRunHandoffNotifiedWithoutBlocking).toBe(0);
+    expect(result.routineExecutionOriginExempted).toBe(1);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("in_progress");
+    expect(sourceIssue?.unblockDescriptor).toBeNull();
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
   });
 
   it("converts a continuation parked for review into a dependency wait on its open sub-tasks", async () => {

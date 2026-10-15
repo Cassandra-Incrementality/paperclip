@@ -10,10 +10,12 @@ import {
   buildSuccessfulRunHandoffRequiredNotice,
   decideSuccessfulRunHandoff,
   isIdempotentFinishSuccessfulRunHandoffWakeStatus,
+  isLiveDeclaredStatus,
   isSuccessfulRunHandoffValidPathSkip,
   isPluginManagedIssueLifecycle,
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
+  parseDeclaredStatus,
 } from "./successful-run-handoff.js";
 import { UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON } from "@paperclipai/adapter-utils/server-utils";
 
@@ -261,6 +263,40 @@ describe("successful run handoff decision", () => {
     expect(decide({ issue: { ...issue, originKind: null } as any }).kind).toBe("enqueue");
   });
 
+  it("does not queue for a routine-execution origin issue (PPC-6171)", () => {
+    expect(decide({ issue: { ...issue, originKind: "routine_execution" } as any })).toEqual({
+      kind: "skip",
+      reason: "routine execution carrier is never a disposition target",
+    });
+  });
+
+  describe("isLiveDeclaredStatus", () => {
+    it("recognizes the Paperclip agent output contract's bolded Status line", () => {
+      expect(isLiveDeclaredStatus("**TL;DR:** doing stuff\n**Status:** on-track")).toBe(true);
+      expect(isLiveDeclaredStatus("**Status:** in_progress")).toBe(true);
+      expect(isLiveDeclaredStatus("**Status:** in-progress")).toBe(true);
+      expect(isLiveDeclaredStatus("Status: on-track (no bold)")).toBe(true);
+    });
+
+    it("does not treat terminal or waiting dispositions as live", () => {
+      expect(isLiveDeclaredStatus("**Status:** done")).toBe(false);
+      expect(isLiveDeclaredStatus("**Status:** blocked")).toBe(false);
+      expect(isLiveDeclaredStatus("**Status:** waiting-on-you")).toBe(false);
+    });
+
+    it("returns false when there is no declared status at all", () => {
+      expect(isLiveDeclaredStatus("still running in the background, I'll pick back up once it finishes")).toBe(false);
+      expect(isLiveDeclaredStatus(null)).toBe(false);
+      expect(isLiveDeclaredStatus(undefined)).toBe(false);
+      expect(isLiveDeclaredStatus("")).toBe(false);
+    });
+
+    it("parseDeclaredStatus lowercases and extracts the raw value", () => {
+      expect(parseDeclaredStatus("**Status:** On-Track")).toBe("on-track");
+      expect(parseDeclaredStatus("no status line here")).toBeNull();
+    });
+  });
+
   describe("isPluginManagedIssueLifecycle", () => {
     it("is true for any plugin: prefixed origin kind", () => {
       expect(isPluginManagedIssueLifecycle({ originKind: "plugin:paperclip.workflow-engine" })).toBe(true);
@@ -302,6 +338,7 @@ describe("successful run handoff decision", () => {
     expect(isSuccessfulRunHandoffValidPathSkip(decide({ hasQueuedWake: true }))).toBe(true);
     expect(isSuccessfulRunHandoffValidPathSkip(decide({ budgetBlocked: true }))).toBe(false);
     expect(isSuccessfulRunHandoffValidPathSkip(decide({ nextAction: "Still running in the background." }))).toBe(true);
+    expect(isSuccessfulRunHandoffValidPathSkip(decide({ issue: { ...issue, originKind: "routine_execution" } as any }))).toBe(true);
   });
 
   it("does not post the stage-1 missing-disposition notice when the assignee's own report states an in-flight continuation (PPC-6222)", () => {

@@ -65,6 +65,39 @@ export function isPluginManagedIssueLifecycle(issue: { originKind?: string | nul
   return Boolean(issue.originKind?.startsWith("plugin:"));
 }
 
+/**
+ * PPC-6171: the stage-2 escalation path fired 27 of 28 times within 2m35s of
+ * the assignee's own comment, including once on a `Status: on-track` comment
+ * only 13.7s old. Recency windows don't fix this -- the one firing that caused
+ * real damage (PPC-6289) landed 30m05s after the assignee's last comment, past
+ * any window short enough to not also mask genuinely stuck issues. Read the
+ * assignee's own declared disposition instead: the Paperclip agent output
+ * contract (`**Status:** <value>`) already has the assignee state this on
+ * every comment, so trust it over elapsed time.
+ *
+ * Deliberately NOT wired into decideSuccessfulRunHandoff (the stage-1 "needs
+ * a disposition" notice): PPC-6222 already tried an equivalent
+ * comment-presence check there and reverted it -- at that call site the run's
+ * own completion summary has almost always just been posted as a comment, so
+ * the signal is true on nearly every firing and silences the notice even for
+ * ordinary completions that genuinely lack a disposition. It is safe at
+ * stage-2 because isExhaustedSuccessfulRunHandoff has already filtered out
+ * every run that picked a real disposition, so what's left is specifically
+ * "kept posting status updates without one."
+ */
+const LIVE_DECLARED_STATUS_VALUES = new Set(["on-track", "in_progress", "in-progress"]);
+
+export function parseDeclaredStatus(body: string | null | undefined): string | null {
+  if (!body) return null;
+  const match = body.match(/\*{0,2}status:\*{0,2}\s*`?([a-z_-]+)/i);
+  return match ? match[1].toLowerCase() : null;
+}
+
+export function isLiveDeclaredStatus(body: string | null | undefined): boolean {
+  const declared = parseDeclaredStatus(body);
+  return declared !== null && LIVE_DECLARED_STATUS_VALUES.has(declared);
+}
+
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = Pick<
   typeof issues.$inferSelect,
@@ -133,6 +166,7 @@ const SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS = new Set([
   "issue is under an active pause hold",
   "corrective handoff wake already exists for this source run",
   "assignee's own report states an in-flight continuation",
+  "routine execution carrier is never a disposition target",
 ]);
 
 export function isSuccessfulRunHandoffValidPathSkip(
@@ -201,12 +235,21 @@ export function buildSuccessfulRunHandoffExhaustedNotice(input: {
   latestIssueStatus: string;
   latestHandoffRunStatus: string;
   missingDisposition: string;
+  // PPC-6171: when there is no first-class blocker and no real recovery-action
+  // owner, the issue is deliberately left in_progress instead of being set
+  // blocked with a boilerplate descriptor nobody can act on -- the title and
+  // body must say so rather than claim a transition that didn't happen.
+  issueLeftInProgress?: boolean;
 }): SuccessfulRunHandoffNotice {
   return {
-    body: SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
+    body: input.issueLeftInProgress
+      ? "Paperclip could not resolve this issue's missing disposition automatically. The source assignment is unchanged, and no real recovery owner could be identified, so the issue was left as-is rather than blocked on a dead-end descriptor. A board decision is required."
+      : SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
     presentation: systemNoticePresentation({
       tone: "danger",
-      title: "Missing disposition recovery blocked",
+      title: input.issueLeftInProgress
+        ? "Missing disposition recovery could not identify an owner"
+        : "Missing disposition recovery blocked",
     }),
     metadata: {
       version: 1,
@@ -509,6 +552,13 @@ export function decideSuccessfulRunHandoff(input: {
   }
   if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };
+  }
+  // PPC-6171: a routine-execution carrier is re-minted fresh every run and
+  // the routine never revisits the prior day's issue, so a missing-
+  // disposition notice or escalation on one is permanent litter nobody will
+  // ever act on.
+  if (issue.originKind === "routine_execution") {
+    return { kind: "skip", reason: "routine execution carrier is never a disposition target" };
   }
   if (input.hasActiveRoutineContinuation) {
     return { kind: "skip", reason: "active routine continuation owns the next action" };
