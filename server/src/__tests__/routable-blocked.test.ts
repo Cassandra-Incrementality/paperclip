@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   deliverAgentUnblockNotification,
   ROUTABLE_BLOCKED_ROLLOUT_AT,
+  unblockDescriptorsEqual,
 } from "../services/routable-blocked.js";
 
 const agentId = "00000000-0000-4000-8000-000000000001";
@@ -72,5 +73,53 @@ describe("routable blocked notifications", () => {
     expect(wakeup.mock.calls[0]?.[1]).toMatchObject({
       idempotencyKey: expect.stringContaining(secondTransition.toISOString()),
     });
+  });
+});
+
+describe("unblockDescriptorsEqual", () => {
+  it("treats null and undefined descriptors as equal to each other", () => {
+    expect(unblockDescriptorsEqual(null, undefined)).toBe(true);
+    expect(unblockDescriptorsEqual(undefined, undefined)).toBe(true);
+    expect(unblockDescriptorsEqual(null, { owner: "board", action: "x" })).toBe(false);
+    expect(unblockDescriptorsEqual({ owner: "board", action: "x" }, null)).toBe(false);
+  });
+
+  it("is sensitive to the action text", () => {
+    const owner = { agentId };
+    expect(unblockDescriptorsEqual({ owner, action: "Fix it" }, { owner, action: "Fix it" })).toBe(true);
+    expect(unblockDescriptorsEqual({ owner, action: "Fix it" }, { owner, action: "Fix it now" })).toBe(false);
+  });
+
+  it("treats board descriptors as equal only to other board descriptors", () => {
+    expect(unblockDescriptorsEqual(
+      { owner: "board", action: "Inspect the run evidence" },
+      { owner: "board", action: "Inspect the run evidence" },
+    )).toBe(true);
+    expect(unblockDescriptorsEqual(
+      { owner: "board", action: "Inspect the run evidence" },
+      { owner: { agentId }, action: "Inspect the run evidence" },
+    )).toBe(false);
+  });
+
+  it("distinguishes agent owners by id, not just by owner shape", () => {
+    expect(unblockDescriptorsEqual(
+      { owner: { agentId }, action: "Fix it" },
+      { owner: { agentId: "00000000-0000-4000-8000-000000000099" }, action: "Fix it" },
+    )).toBe(false);
+    expect(unblockDescriptorsEqual(
+      { owner: { agentId }, action: "Fix it" },
+      { owner: { userId: agentId }, action: "Fix it" },
+    )).toBe(false);
+  });
+
+  it("distinguishes user owners by id", () => {
+    expect(unblockDescriptorsEqual(
+      { owner: { userId: "user-1" }, action: "Review" },
+      { owner: { userId: "user-1" }, action: "Review" },
+    )).toBe(true);
+    expect(unblockDescriptorsEqual(
+      { owner: { userId: "user-1" }, action: "Review" },
+      { owner: { userId: "user-2" }, action: "Review" },
+    )).toBe(false);
   });
 });

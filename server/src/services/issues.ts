@@ -130,6 +130,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
+import { unblockDescriptorsEqual } from "./routable-blocked.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
@@ -7683,6 +7684,17 @@ export function issueService(db: Db) {
       } else if (existing.status === "blocked" && issueData.status && issueData.status !== "blocked") {
         patch.unblockDescriptor = null;
         patch.blockedTransitionAt = null;
+        patch.blockedOwnerNotifiedAt = null;
+      } else if (
+        existing.status === "blocked" &&
+        (issueData.status === undefined || issueData.status === "blocked") &&
+        issueData.unblockDescriptor !== undefined &&
+        !unblockDescriptorsEqual(issueData.unblockDescriptor, existing.unblockDescriptor)
+      ) {
+        // A descriptor repair on an issue that is already blocked names a (possibly
+        // new) owner. Clear the prior notification so the delivery path below treats
+        // this write the same as the original transition into blocked, instead of
+        // silently no-op'ing because blockedOwnerNotifiedAt is already set.
         patch.blockedOwnerNotifiedAt = null;
       }
       if (issueData.requestDepth !== undefined) {

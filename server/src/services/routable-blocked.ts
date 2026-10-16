@@ -20,6 +20,19 @@ export function isProspectiveBlockedTransition(issue: RoutableBlockedIssue): iss
     Boolean(issue.blockedTransitionAt && issue.blockedTransitionAt >= ROUTABLE_BLOCKED_ROLLOUT_AT);
 }
 
+export function unblockDescriptorsEqual(
+  a: IssueUnblockDescriptor | null | undefined,
+  b: IssueUnblockDescriptor | null | undefined,
+): boolean {
+  if (!a || !b) return !a === !b;
+  if (a.action !== b.action) return false;
+  const ownerA = a.owner;
+  const ownerB = b.owner;
+  if (ownerA === "board" || ownerB === "board") return ownerA === ownerB;
+  if ("agentId" in ownerA) return "agentId" in ownerB && ownerA.agentId === ownerB.agentId;
+  return "userId" in ownerB && ownerA.userId === ownerB.userId;
+}
+
 export async function deliverAgentUnblockNotification(input: {
   issue: RoutableBlockedIssue;
   wakeup: (agentId: string, options: {

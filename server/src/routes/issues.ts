@@ -235,7 +235,7 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
-import { deliverAgentUnblockNotification } from "../services/routable-blocked.js";
+import { deliverAgentUnblockNotification, unblockDescriptorsEqual } from "../services/routable-blocked.js";
 import {
   assertIssueReviewVerdictActorAllowed,
   isIssueReviewVerdictInteraction,
@@ -9801,6 +9801,16 @@ export function issueRoutes(
       }
     }
     const enteringBlocked = existing.status !== "blocked" && updateFields.status === "blocked";
+    // A descriptor repair on an issue that is already blocked (e.g. replacing the
+    // missing-disposition guard's boilerplate `{"owner":"board",...}` with a real
+    // owner) must notify just as much as the original transition into blocked does
+    // — otherwise the repair renders correctly to a human and reaches nobody.
+    const descriptorRepairedWhileBlocked =
+      !enteringBlocked &&
+      existing.status === "blocked" &&
+      nextStatus === "blocked" &&
+      updateFields.unblockDescriptor !== undefined &&
+      !unblockDescriptorsEqual(updateFields.unblockDescriptor, existing.unblockDescriptor);
     if (enteringBlocked) {
       const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
         ? [...new Set(req.body.blockedByIssueIds as string[])]
@@ -10100,7 +10110,7 @@ export function issueRoutes(
     }
     for (const publication of postCommitActivityPublications) publishActivity(publication);
 
-    if (enteringBlocked) {
+    if (enteringBlocked || descriptorRepairedWhileBlocked) {
       const blockedIssue = issue;
       let ownerNotifiedAt: Date | null = null;
       await deliverAgentUnblockNotification({
