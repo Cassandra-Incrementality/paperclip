@@ -1046,6 +1046,57 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     });
   });
 
+  it("reuses the raced liveness escalation instead of throwing when concurrent reconciliations race on the same incident (PPC-7087)", async () => {
+    await enableAutoRecovery();
+    const { companyId, blockedIssueId } = await seedBlockedChain({
+      blockerStatus: "backlog",
+      blockerAssigneeAgentId: "coder",
+    });
+    const heartbeat = heartbeatService(db);
+
+    // Each concurrent reconciliation call does its own check-then-act: it
+    // selects for an existing open escalation (misses, since none has
+    // committed yet), then tries to insert one. The DB's partial unique index
+    // (issues_active_liveness_recovery_incident_uq / _leaf_uq) makes every
+    // loser's insert throw 23505. isUniqueLivenessRecoveryConflict must walk
+    // `error.cause` and check `constraint_name` (the drizzle/postgres.js
+    // shape) to recognize that and reuse the winner's row instead of letting
+    // the error propagate out of reconcileIssueGraphLiveness.
+    const results = await Promise.allSettled(
+      Array.from({ length: 8 }, () => heartbeat.reconcileIssueGraphLiveness()),
+    );
+    expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalations).toHaveLength(1);
+
+    const blockerRelations = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(and(
+        eq(issueRelations.companyId, companyId),
+        eq(issueRelations.relatedIssueId, blockedIssueId),
+        eq(issueRelations.type, "blocks"),
+      ));
+    expect(blockerRelations.map((row) => row.blockerIssueId)).toContain(escalations[0]?.id);
+
+    const creationActivity = await db
+      .select()
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.entityId, blockedIssueId),
+        eq(activityLog.action, "issue.blockers.updated"),
+      ));
+    const escalationIdsSeen = new Set(
+      creationActivity.map((row) => (row.details as Record<string, unknown> | null)?.escalationIssueId),
+    );
+    expect(escalationIdsSeen.size).toBe(1);
+    expect([...escalationIdsSeen][0]).toBe(escalations[0]?.id);
+  });
+
   it("treats open recovery issues as active waiting paths for non-assigned-backlog states", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
