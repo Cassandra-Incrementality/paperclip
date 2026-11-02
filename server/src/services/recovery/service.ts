@@ -629,6 +629,28 @@ function livenessRecoveryLeafKey(companyId: string, state: string, leafIssueId: 
   return buildIssueGraphLivenessLeafKey({ companyId, state, leafIssueId });
 }
 
+export function isUniqueStrandedIssueRecoveryConflict(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  // drizzle (pg-core, postgres.js dialect) wraps the driver error in a
+  // DrizzleQueryError whose own `.message`/`.code` describe the failed query,
+  // not the constraint violation; the real PostgresError — carrying `code`
+  // (SQLSTATE) and `constraint_name` (not `constraint`) — lives one level
+  // down on `.cause`. Check both this object and its cause defensively, since
+  // a future driver/wrapper change could flatten or rename either.
+  const maybe = error as { code?: string; constraint?: string; constraint_name?: string; message?: string; cause?: unknown };
+  const isMatch =
+    maybe.code === "23505" &&
+    (
+      maybe.constraint === "issues_active_stranded_issue_recovery_uq" ||
+      maybe.constraint_name === "issues_active_stranded_issue_recovery_uq" ||
+      typeof maybe.message === "string" &&
+        maybe.message.includes("issues_active_stranded_issue_recovery_uq")
+    );
+  if (isMatch) return true;
+  if (maybe.cause && maybe.cause !== error) return isUniqueStrandedIssueRecoveryConflict(maybe.cause);
+  return false;
+}
+
 function isUniqueLivenessRecoveryConflict(error: unknown) {
   if (!error || typeof error !== "object") return false;
   const maybe = error as { code?: string; constraint?: string; message?: string };

@@ -5201,6 +5201,27 @@ export function issueService(db: Db) {
     return heartbeatRunIsTerminalOrMissing(dbOrTx, runId);
   }
 
+  // Mirrors the 10-minute inactivity TTL that already governs stale
+  // checkout-lock adoption elsewhere — a non-terminal run that hasn't
+  // touched its row in that long is treated as dead for guard purposes,
+  // not as a still-live sibling.
+  const STALE_SAME_AGENT_THREAD_GUARD_RUN_TTL_MS = 10 * 60 * 1000;
+
+  async function isDeadOrStaleHeartbeatRunForThreadGuard(
+    runId: string,
+    dbOrTx: DbReader = db,
+    now: Date = new Date(),
+  ) {
+    const run = await dbOrTx
+      .select({ status: heartbeatRuns.status, updatedAt: heartbeatRuns.updatedAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows: Array<{ status: string; updatedAt: Date }>) => rows[0] ?? null);
+    if (!run) return true;
+    if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+    return now.getTime() - new Date(run.updatedAt).getTime() > STALE_SAME_AGENT_THREAD_GUARD_RUN_TTL_MS;
+  }
+
   /**
    * PPC-3187: finds a comment a *different, still-live* run of the same agent
    * already wrote to this issue thread. Guards the issue a run *writes to* —
@@ -5238,7 +5259,7 @@ export function issueService(db: Db) {
 
     for (const candidate of candidates) {
       if (!candidate.createdByRunId) continue;
-      const siblingIsDeadOrStale = await isTerminalOrMissingHeartbeatRun(candidate.createdByRunId, dbOrTx);
+      const siblingIsDeadOrStale = await isDeadOrStaleHeartbeatRunForThreadGuard(candidate.createdByRunId, dbOrTx);
       if (!siblingIsDeadOrStale) {
         return {
           commentId: candidate.id,
