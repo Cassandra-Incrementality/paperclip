@@ -155,6 +155,42 @@ export interface StartedServer {
   databaseUrl: string;
 }
 
+// PPC-7111: a restart that loses the port race must not silently come up on a
+// different port while still presenting itself as the instance. A control
+// plane bound to an unreachable port still writes to the shared database and
+// still spawns agent processes, which is worse than refusing to start — it
+// produced a 3-minute dual control plane and a 16-run retry cascade on
+// 2026-11-02. Wait a bounded amount of time for whatever is holding the
+// requested port to release it (the common case: an old instance mid-exit
+// during a restart), then fail closed instead of falling back to another
+// port.
+const PORT_ACQUIRE_RETRY_INTERVAL_MS = 1000;
+const PORT_ACQUIRE_MAX_RETRIES = 10;
+
+async function acquireListenPort(requestedPort: number): Promise<number> {
+  for (let attempt = 0; attempt <= PORT_ACQUIRE_MAX_RETRIES; attempt++) {
+    const detectedPort = await detectPort(requestedPort);
+    if (detectedPort === requestedPort) return requestedPort;
+
+    if (attempt === PORT_ACQUIRE_MAX_RETRIES) {
+      throw new Error(
+        `Port ${requestedPort} is still held after ${PORT_ACQUIRE_MAX_RETRIES} retries ` +
+          `(${(PORT_ACQUIRE_MAX_RETRIES * PORT_ACQUIRE_RETRY_INTERVAL_MS) / 1000}s). Refusing to start on ` +
+          `a different port (next free port: ${detectedPort}). Check what is holding it: ` +
+          `lsof -nP -iTCP:${requestedPort} -sTCP:LISTEN`,
+      );
+    }
+
+    logger.warn(
+      `Port ${requestedPort} is in use (attempt ${attempt + 1}/${PORT_ACQUIRE_MAX_RETRIES}) — ` +
+        `waiting ${PORT_ACQUIRE_RETRY_INTERVAL_MS}ms for it to free up before refusing to start`,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, PORT_ACQUIRE_RETRY_INTERVAL_MS));
+  }
+
+  throw new Error(`Port ${requestedPort} acquisition failed`); // unreachable
+}
+
 export async function startServer(): Promise<StartedServer> {
   warnIfUnsupportedNodeVersion(process.versions.node, (message) => logger.warn(message));
 
@@ -595,7 +631,7 @@ export async function startServer(): Promise<StartedServer> {
   }
 
   const requestedListenPort = config.port;
-  const listenPort = await detectPort(requestedListenPort);
+  const listenPort = await acquireListenPort(requestedListenPort);
   if (config.authBaseUrlMode === "explicit" && config.authPublicBaseUrl) {
     config.authPublicBaseUrl = rewriteLoopbackUrlPort(config.authPublicBaseUrl, listenPort);
   }
@@ -888,10 +924,6 @@ export async function startServer(): Promise<StartedServer> {
   // This prevents intermittent 502/ECONNRESET errors caused by Node's 5s default.
   server.keepAliveTimeout = 185000;
   server.headersTimeout = 186000;
-  
-  if (listenPort !== requestedListenPort) {
-    logger.warn(`Requested port is busy; using next free port (requestedPort=${requestedListenPort}, selectedPort=${listenPort})`);
-  }
   
   const runtimeListenHost = config.host;
   const runtimeApiUrl = choosePrimaryRuntimeApiUrl({

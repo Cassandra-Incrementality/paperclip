@@ -610,7 +610,12 @@ describe("startServer authenticated auth origin setup", () => {
     process.env.BETTER_AUTH_SECRET = "test-secret";
   });
 
-  it("derives trusted origins from the detected listen port before auth initializes", async () => {
+  it("derives trusted origins from the configured port after retrying past a transient conflict", async () => {
+    // PPC-7111: the server no longer falls back to a different port when the
+    // requested one is busy — it retries until the requester's own port frees
+    // up (or refuses to start). `detectPortMock`'s default implementation
+    // (`async (port) => port`) reports the requested port as free again from
+    // the second call onward, simulating the old holder releasing it.
     loadConfigMock.mockReturnValue(buildTestConfig({
       port: 3210,
       allowedHostnames: ["board.example.test"],
@@ -624,26 +629,50 @@ describe("startServer authenticated auth origin setup", () => {
       ],
     );
 
-    await startServer();
+    vi.useFakeTimers();
+    const startPromise = startServer();
+    await vi.advanceTimersByTimeAsync(1000);
+    await startPromise;
+    vi.useRealTimers();
 
     expect(deriveAuthTrustedOriginsMock).toHaveBeenCalledWith(
       expect.objectContaining({
         port: 3210,
-        authPublicBaseUrl: "http://127.0.0.1:3211/",
+        authPublicBaseUrl: "http://127.0.0.1:3210/",
       }),
-      { listenPort: 3211 },
+      { listenPort: 3210 },
     );
     expect(createBetterAuthInstanceMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
         port: 3210,
-        authPublicBaseUrl: "http://127.0.0.1:3211/",
+        authPublicBaseUrl: "http://127.0.0.1:3210/",
       }),
-      ["http://board.example.test:3211"],
+      ["http://board.example.test:3210"],
     );
     expect(createAppMock.mock.calls[0]?.[1]).toMatchObject({
-      serverPort: 3211,
+      serverPort: 3210,
     });
+  });
+
+  it("refuses to start when the configured port is still held after every retry", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ port: 3210 }));
+    // Persistent override (not `*Once`) so every retry attempt sees the port as busy;
+    // restored below so it doesn't leak the "always busy" behavior into later tests.
+    detectPortMock.mockResolvedValue(3299);
+
+    try {
+      vi.useFakeTimers();
+      const startPromise = startServer();
+      const assertion = expect(startPromise).rejects.toThrow(/Port 3210 is still held after 10 retries/);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await assertion;
+      vi.useRealTimers();
+
+      expect(createAppMock).not.toHaveBeenCalled();
+    } finally {
+      detectPortMock.mockImplementation(async (port: number) => port);
+    }
   });
 });
 
@@ -711,7 +740,14 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     );
   });
 
-  it("preserves explicit-port external auth public URLs when detect-port selects a new port", async () => {
+  it("preserves explicit-port external auth public URLs after retrying past a transient port conflict", async () => {
+    // PPC-7111 removed the silent fallback to a different port that this test originally
+    // guarded (BRO-1558: rewriting an explicit external base URL to the internal fallback
+    // listen port produced an unreachable URL that leaked to spawned agents as a dead
+    // PAPERCLIP_API_URL). The server now retries the REQUESTED port instead of adopting a
+    // different one, so the regression this test protects — don't rewrite an explicit
+    // external URL to whatever port the server happens to end up on — is exercised against
+    // the post-retry port, which here converges back to the originally requested 3100.
     loadConfigMock.mockReturnValueOnce(buildTestConfig({
       port: 3100,
       authBaseUrlMode: "explicit",
@@ -719,17 +755,18 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     }));
     detectPortMock.mockResolvedValueOnce(3110);
 
-    const started = await startServer();
+    vi.useFakeTimers();
+    const startPromise = startServer();
+    await vi.advanceTimersByTimeAsync(1000);
+    const started = await startPromise;
+    vi.useRealTimers();
 
-    // The server listens internally on 3110, but an explicit *external* base URL must keep
-    // its advertised port. Rewriting it to the internal listen port produced an unreachable
-    // URL that leaked to spawned agents as a dead PAPERCLIP_API_URL. (BRO-1558)
-    expect(started.listenPort).toBe(3110);
+    expect(started.listenPort).toBe(3100);
     expect(started.apiUrl).toBe("http://my-host.ts.net:3100");
     expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://my-host.ts.net:3100");
   });
 
-  it("keeps no-port auth public URLs stable when detect-port selects a new port", async () => {
+  it("keeps no-port auth public URLs stable after retrying past a transient port conflict", async () => {
     loadConfigMock.mockReturnValueOnce(buildTestConfig({
       port: 3100,
       authBaseUrlMode: "explicit",
@@ -737,9 +774,13 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     }));
     detectPortMock.mockResolvedValueOnce(3110);
 
-    const started = await startServer();
+    vi.useFakeTimers();
+    const startPromise = startServer();
+    await vi.advanceTimersByTimeAsync(1000);
+    const started = await startPromise;
+    vi.useRealTimers();
 
-    expect(started.listenPort).toBe(3110);
+    expect(started.listenPort).toBe(3100);
     expect(started.apiUrl).toBe("https://paperclip.example");
     expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("https://paperclip.example");
   });
