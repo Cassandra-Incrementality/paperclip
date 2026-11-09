@@ -10,6 +10,7 @@ import {
   updateDocumentAnnotationThreadSchema,
   updateRoutineSchema,
   updateRoutineTriggerSchema,
+  truncateByCodePoint,
 } from "@paperclipai/shared";
 import { trackRoutineCreated } from "@paperclipai/shared/telemetry";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
@@ -312,7 +313,7 @@ export function routineRoutes(
           documentKey: routineDocumentKey,
           threadId: comment.threadId,
           commentId: comment.id,
-          bodySnippet: comment.body.slice(0, 120),
+          bodySnippet: truncateByCodePoint(comment.body, 120),
         },
       });
       res.status(201).json(comment);

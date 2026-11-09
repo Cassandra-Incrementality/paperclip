@@ -102,6 +102,7 @@ import {
   type WorkspaceRuntimeService,
   issueWriteDenialCodeForResponsibleUserDenial,
   issueWriteDenialResponse,
+  truncateByCodePoint,
   type IssueWriteDenialCode,
   type IssueWriteDenialContext,
 } from "@paperclipai/shared";
@@ -7439,7 +7440,7 @@ export function issueRoutes(
           documentKey: keyParsed.data,
           threadId: comment.threadId,
           commentId: comment.id,
-          bodySnippet: comment.body.slice(0, 120),
+          bodySnippet: truncateByCodePoint(comment.body, 120),
           ...summarizeIssueReferenceActivityDetails({
             addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
             removedReferencedIssues: referenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
@@ -10546,7 +10547,7 @@ export function issueRoutes(
         entityId: issue.id,
         details: {
           commentId: comment.id,
-          bodySnippet: comment.body.slice(0, 120),
+          bodySnippet: truncateByCodePoint(comment.body, 120),
           identifier: issue.identifier,
           issueTitle: issue.title,
           authorizationReason: issueMutationAuthorizationReason,
@@ -12059,7 +12060,7 @@ export function issueRoutes(
         entityId: issue.id,
         details: {
           commentId: removed.id,
-          bodySnippet: removed.body.slice(0, 120),
+          bodySnippet: truncateByCodePoint(removed.body, 120),
           identifier: issue.identifier,
           issueTitle: issue.title,
           source: "queue_cancel",
@@ -12618,6 +12619,10 @@ export function issueRoutes(
         logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue comment"));
     }
 
+    // Best-effort audit log: the comment itself is already committed by this
+    // point, so a failure writing its activity-log record (e.g. an encoding
+    // edge case we haven't anticipated) must never turn an already-successful
+    // comment post into a 500 for the caller (PPC-7299).
     await logActivity(db, {
       companyId: currentIssue.companyId,
       actorType: actor.actorType,
@@ -12631,7 +12636,7 @@ export function issueRoutes(
       entityId: currentIssue.id,
       details: {
         commentId: comment.id,
-        bodySnippet: comment.body.slice(0, 120),
+        bodySnippet: truncateByCodePoint(comment.body, 120),
         identifier: currentIssue.identifier,
         issueTitle: currentIssue.title,
         authorizationReason: commentAuthorizationReason,
@@ -12654,7 +12659,8 @@ export function issueRoutes(
           currentReferencedIssues: commentReferenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
         }),
       },
-    });
+    }).catch((err) =>
+      logger.warn({ err, issueId: currentIssue.id, commentId: comment.id }, "failed to log issue.comment_added activity"));
 
     const expiredInteractions = await issueThreadInteractionService(db).expireRequestConfirmationsSupersededByComment(
       currentIssue,
