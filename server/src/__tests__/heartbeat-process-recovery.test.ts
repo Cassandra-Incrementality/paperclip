@@ -120,6 +120,7 @@ import {
   noticeMetadataReferencesRecoveryAction,
 } from "../services/recovery/index.ts";
 import { collectDispositionRepairSourceState } from "../services/recovery/disposition-repair.ts";
+import { SUCCESSFUL_RUN_HANDOFF_ESCALATION_MAX_ATTEMPTS } from "../services/recovery/service.ts";
 import {
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
@@ -1006,6 +1007,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     previousOwnerAgentId?: string | null;
     returnOwnerAgentId?: string | null;
     expectedIssueStatus?: "blocked" | "in_progress";
+    maxAttempts?: number | null;
   }) {
     const action = await waitForValue(async () =>
       db.select().from(issueRecoveryActions).where(
@@ -1029,7 +1031,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       returnOwnerAgentId: input.returnOwnerAgentId ?? input.agentId,
       cause: input.cause ?? "stranded_assigned_issue",
       attemptCount: 1,
-      maxAttempts: null,
+      // PPC-7577: successful_run_missing_state is the one cause that gets a
+      // real cap (it is also the one cause that can leave the issue
+      // in_progress instead of transitioning it to blocked, so it never ages
+      // out of reconcileStrandedAssignedIssues' candidate query on its own).
+      maxAttempts: input.maxAttempts !== undefined
+        ? input.maxAttempts
+        : input.cause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+          ? SUCCESSFUL_RUN_HANDOFF_ESCALATION_MAX_ATTEMPTS
+          : null,
     });
     expect(action.evidence).toMatchObject({
       sourceIssueId: input.issueId,
@@ -4059,6 +4069,96 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_escalated")).toBe(true);
+  });
+
+  it("PPC-7577: caps repeated missing-disposition handoff escalation instead of retrying every sweep tick", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "adapter_failed",
+      runError: "boom",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    // First sweep tick: creates the recovery action and posts the one
+    // escalation comment (attemptCount 1, maxAttempts now a real cap instead
+    // of NULL).
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.successfulRunHandoffNotifiedWithoutBlocking).toBe(1);
+    const afterFirst = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows[0]!);
+    expect(afterFirst.attemptCount).toBe(1);
+    expect(afterFirst.maxAttempts).toBe(SUCCESSFUL_RUN_HANDOFF_ESCALATION_MAX_ATTEMPTS);
+    // PPC-7577 fix #2: lastAttemptAt must advance on this attempt, not stay
+    // frozen at some pre-existing value -- it should land within a second of
+    // "now" rather than, say, epoch-zero or a stale persisted timestamp.
+    expect(Math.abs(Date.now() - (afterFirst.lastAttemptAt?.getTime() ?? 0))).toBeLessThan(5_000);
+
+    // Second sweep tick, immediately after the first (same shape as the
+    // real 30s-cadence sweep): the exponential backoff has not elapsed, so
+    // this must be a no-op -- no new write, no new comment, attemptCount
+    // unchanged. Before the fix, every tick re-called
+    // escalateStrandedAssignedIssue unconditionally (605 times in the field
+    // incident).
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.successfulRunHandoffNotifiedWithoutBlocking).toBe(0);
+    expect(second.successfulRunHandoffAttemptCapped).toBe(0);
+    const afterSecond = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows[0]!);
+    expect(afterSecond.attemptCount).toBe(1);
+    expect(afterSecond.lastAttemptAt?.getTime()).toBe(afterFirst.lastAttemptAt?.getTime());
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+
+    // Simulate the backoff having elapsed and the action already being at
+    // the cap (as it would be after SUCCESSFUL_RUN_HANDOFF_ESCALATION_MAX_ATTEMPTS
+    // real attempts): the reconciler must stop calling escalate entirely,
+    // not keep incrementing attemptCount forever.
+    await db
+      .update(issueRecoveryActions)
+      .set({
+        attemptCount: SUCCESSFUL_RUN_HANDOFF_ESCALATION_MAX_ATTEMPTS,
+        lastAttemptAt: new Date(Date.now() - 24 * 60 * 60 * 1000),
+      })
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+
+    const third = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(third.successfulRunHandoffNotifiedWithoutBlocking).toBe(0);
+    expect(third.successfulRunHandoffAttemptCapped).toBe(1);
+    const afterThird = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
+      .then((rows) => rows[0]!);
+    expect(afterThird.attemptCount).toBe(SUCCESSFUL_RUN_HANDOFF_ESCALATION_MAX_ATTEMPTS);
+
+    const commentsAfterCap = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(commentsAfterCap).toHaveLength(1);
   });
 
   it("escalates an exhausted successful handoff run that still leaves no disposition", async () => {

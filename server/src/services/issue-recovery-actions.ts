@@ -332,9 +332,13 @@ export function issueRecoveryActionService(db: Db) {
           timeoutAt: input.preserveExistingOwner
             ? asDatabaseDate(existing.timeoutAt)
             : input.timeoutAt ?? null,
-          lastAttemptAt: input.preserveExistingOwner
-            ? asDatabaseDate(existing.lastAttemptAt)
-            : input.lastAttemptAt ?? now,
+          // lastAttemptAt is attempt telemetry, not owner-identity config -- it
+          // must advance on every attempt regardless of preserveExistingOwner,
+          // the same way attemptCount does below. Gating it on
+          // preserveExistingOwner froze it at the row's creation time across
+          // every subsequent attempt (PPC-7577: 605 attempts over 5h02m all
+          // read back the original created_at).
+          lastAttemptAt: input.lastAttemptAt ?? now,
           outcome: input.preserveExistingOwner ? existing.outcome : null,
           resolutionNote: input.preserveExistingOwner ? existing.resolutionNote : null,
           resolvedAt: null,

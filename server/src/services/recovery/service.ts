@@ -386,6 +386,20 @@ const INTERACTION_CONTINUATION_REQUEUE_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
+
+// PPC-7577: the missing-disposition handoff cause deliberately leaves the
+// issue `in_progress` instead of `blocked` when no real recovery owner can
+// be identified (PPC-6171, see noActionableOwnerForMissingDisposition
+// below) -- that is correct, a dead-end "Board operator" descriptor is
+// worse than no descriptor. But it also means the issue keeps matching this
+// sweep's candidate query forever, so without its own cap this is the one
+// escalation cause with no natural exit: every other cause transitions the
+// issue to `blocked` and drops out of the candidate set after one call.
+// 605 attempts at a flat 30s cadence over 5h02m (one per sweep tick) is the
+// result of calling escalateStrandedAssignedIssue on every tick with no
+// attempt/backoff gate at all.
+export const SUCCESSFUL_RUN_HANDOFF_ESCALATION_MAX_ATTEMPTS = 5;
+export const SUCCESSFUL_RUN_HANDOFF_ESCALATION_BASE_BACKOFF_MS = 5 * 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
 // Defense in depth (PPC-3303): even a correctly-parsed provider reset time
 // should never park an issue's monitor further out than this, adapter-agnostic,
@@ -2229,7 +2243,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       monitorPolicy: isProviderQuotaWait
         ? { type: "wait_recovery", retryAgentId: routing.returnOwnerAgentId }
         : null,
-      maxAttempts: null,
+      // Every other recoveryCause transitions the issue to `blocked` here and
+      // so drops out of reconcileStrandedAssignedIssues' candidate query on
+      // the next sweep -- null (unbounded) is latent but harmless for them.
+      // SUCCESSFUL_RUN_MISSING_STATE_REASON is the one cause that can leave
+      // the issue `in_progress` (noActionableOwnerForMissingDisposition in
+      // escalateStrandedAssignedIssue below), so it is the one cause that
+      // needs its own cap -- enforced by the backoff/cap check in
+      // reconcileStrandedAssignedIssues before it ever calls
+      // escalateStrandedAssignedIssue.
+      maxAttempts: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+        ? SUCCESSFUL_RUN_HANDOFF_ESCALATION_MAX_ATTEMPTS
+        : null,
       lastAttemptAt: now,
     });
 
@@ -3645,6 +3670,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       declaredLiveStatusExempted: 0,
       routineExecutionOriginExempted: 0,
       successfulRunHandoffNotifiedWithoutBlocking: 0,
+      successfulRunHandoffAttemptCapped: 0,
       operatorCancelExempted: 0,
       skipped: 0,
       issueIds: [] as string[],
@@ -4245,6 +4271,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           result.recentProgressExempted += 1;
           result.skipped += 1;
           continue;
+        }
+
+        // PPC-7577: this is the one escalation cause that can leave the issue
+        // `in_progress` (see noActionableOwnerForMissingDisposition below),
+        // so it never ages out of the candidate query above on its own --
+        // every other cause transitions to `blocked` and exits the candidate
+        // set after a single call. Without a cap here, a sweep running every
+        // 30s re-derives "no recovery owner could be identified" forever: 605
+        // attempts over 5h02m on one issue. Cap at
+        // SUCCESSFUL_RUN_HANDOFF_ESCALATION_MAX_ATTEMPTS attempts with
+        // exponential backoff between them, keyed off the active recovery
+        // action's own attemptCount/lastAttemptAt (now correctly advanced by
+        // issue-recovery-actions.ts on every attempt).
+        const existingHandoffEscalation = await recoveryActionsSvc.getActiveForIssue(
+          issue.companyId,
+          issue.id,
+        );
+        if (existingHandoffEscalation?.cause === SUCCESSFUL_RUN_MISSING_STATE_REASON) {
+          if (existingHandoffEscalation.attemptCount >= SUCCESSFUL_RUN_HANDOFF_ESCALATION_MAX_ATTEMPTS) {
+            result.successfulRunHandoffAttemptCapped += 1;
+            result.skipped += 1;
+            continue;
+          }
+          const lastAttemptAt = existingHandoffEscalation.lastAttemptAt
+            ? new Date(existingHandoffEscalation.lastAttemptAt)
+            : null;
+          if (lastAttemptAt) {
+            const requiredDelay = SUCCESSFUL_RUN_HANDOFF_ESCALATION_BASE_BACKOFF_MS *
+              Math.pow(2, Math.max(0, existingHandoffEscalation.attemptCount - 1));
+            if (Date.now() - lastAttemptAt.getTime() < requiredDelay) {
+              result.skipped += 1;
+              continue;
+            }
+          }
         }
 
         const updated = await escalateStrandedAssignedIssue({
