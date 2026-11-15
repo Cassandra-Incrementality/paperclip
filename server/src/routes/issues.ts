@@ -249,6 +249,12 @@ import {
 } from "../services/issue-thread-interaction-resolution.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
 import {
+  applySiblingHold,
+  classifyCard,
+  computeDueAt,
+  mayDefaultAct,
+} from "../services/default-act-classifier.js";
+import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
   observeCrossIssueInfluence,
@@ -11415,7 +11421,29 @@ export function issueRoutes(
       }, "failed to wake addressee on issue interaction creation"));
     }
 
-    res.status(201).json(interaction);
+    // PPC-7562/PPC-7563: tell the filer whether this card can ever auto-resolve
+    // under the PPC-7478 default-act ruling, instead of leaving them to find
+    // out never. Siblings are the issue's OTHER pending interactions — a card
+    // is also held when any of them is reserved/ambiguous (ported from
+    // board_card_classifier.py's _spread_reserved_within_issue).
+    const ownClassification = classifyCard(interaction);
+    const siblings = await issueThreadInteractionService(db).listForIssue(issue.id);
+    const siblingBuckets = siblings
+      .filter((sibling) => sibling.id !== interaction.id && sibling.status === "pending")
+      .map((sibling) => classifyCard(sibling).bucket);
+    const classification = applySiblingHold(ownClassification, siblingBuckets);
+    const interactionCreatedAt = interaction.createdAt instanceof Date
+      ? interaction.createdAt
+      : new Date(interaction.createdAt);
+    const defaultAct = {
+      bucket: classification.bucket,
+      rule: classification.rule,
+      evidence: classification.evidence,
+      mayDefaultAct: mayDefaultAct(classification.bucket),
+      dueAt: computeDueAt(classification.bucket, interactionCreatedAt),
+    };
+
+    res.status(201).json({ ...interaction, defaultAct });
   });
 
   router.post(

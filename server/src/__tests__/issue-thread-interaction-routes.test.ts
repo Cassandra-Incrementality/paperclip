@@ -567,6 +567,154 @@ describe.sequential("issue thread interaction routes", () => {
     );
   }, 10_000);
 
+  it("returns defaultAct.no_recommendation on the 201 when the card states no recommendation (PPC-7563)", async () => {
+    const createRes = await request(await createApp())
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "suggest_tasks",
+        payload: {
+          version: 1,
+          tasks: [{ clientKey: "task-1", title: "One" }],
+        },
+      });
+
+    expect(createRes.status).toBe(201);
+    expect(createRes.body.defaultAct).toEqual({
+      bucket: "no_recommendation",
+      rule: null,
+      evidence: [],
+      mayDefaultAct: false,
+      dueAt: null,
+    });
+  });
+
+  it("returns defaultAct.reserved with matched evidence for a reserved card (PPC-7563)", async () => {
+    mockInteractionService.create.mockResolvedValueOnce({
+      id: "interaction-reserved",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: RUN_1,
+      title: null,
+      summary: null,
+      payload: {
+        version: 1,
+        prompt: "drop the quadratic term from the ranking formula. recommend b: delete the term.",
+      },
+      result: null,
+      createdAt: "2026-11-15T00:00:00.000Z",
+      updatedAt: "2026-11-15T00:00:00.000Z",
+    });
+
+    const createRes = await request(await createApp())
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "drop the quadratic term from the ranking formula. recommend b: delete the term." },
+      });
+
+    expect(createRes.status).toBe(201);
+    expect(createRes.body.defaultAct).toEqual({
+      bucket: "reserved",
+      rule: "data_loss",
+      evidence: ["delete"],
+      mayDefaultAct: false,
+      dueAt: null,
+    });
+  });
+
+  it("returns defaultAct.internal_reversible with a 14-day dueAt for an eligible card (PPC-7563)", async () => {
+    mockInteractionService.create.mockResolvedValueOnce({
+      id: "interaction-eligible",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: RUN_1,
+      title: null,
+      summary: null,
+      payload: { version: 1, prompt: "rename a helper in mmm_toolkit's docstring glossary. my pick: do it." },
+      result: null,
+      createdAt: "2026-11-15T00:00:00.000Z",
+      updatedAt: "2026-11-15T00:00:00.000Z",
+    });
+
+    const createRes = await request(await createApp())
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "rename a helper in mmm_toolkit's docstring glossary. my pick: do it." },
+      });
+
+    expect(createRes.status).toBe(201);
+    expect(createRes.body.defaultAct).toEqual({
+      bucket: "internal_reversible",
+      rule: null,
+      evidence: [],
+      mayDefaultAct: true,
+      dueAt: "2026-11-29T00:00:00.000Z",
+    });
+  });
+
+  it("holds a card as sibling_reserved when another pending card on the same issue is reserved (PPC-7563)", async () => {
+    mockInteractionService.create.mockResolvedValueOnce({
+      id: "interaction-eligible-but-held",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: RUN_1,
+      title: null,
+      summary: null,
+      payload: { version: 1, prompt: "rename a helper in mmm_toolkit's docstring glossary. my pick: do it." },
+      result: null,
+      createdAt: "2026-11-15T00:00:00.000Z",
+      updatedAt: "2026-11-15T00:00:00.000Z",
+    });
+    mockInteractionService.listForIssue.mockResolvedValueOnce([
+      {
+        id: "interaction-eligible-but-held",
+        status: "pending",
+        title: null,
+        summary: null,
+        payload: { version: 1, prompt: "rename a helper in mmm_toolkit's docstring glossary. my pick: do it." },
+      },
+      {
+        id: "interaction-sibling-reserved",
+        status: "pending",
+        title: null,
+        summary: null,
+        payload: { version: 1, prompt: "mint a new api key for the connector. recommend yes." },
+      },
+    ]);
+
+    const createRes = await request(await createApp())
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "rename a helper in mmm_toolkit's docstring glossary. my pick: do it." },
+      });
+
+    expect(createRes.status).toBe(201);
+    expect(createRes.body.defaultAct).toEqual({
+      bucket: "reserved",
+      rule: "sibling_reserved",
+      evidence: [],
+      mayDefaultAct: false,
+      dueAt: null,
+    });
+  });
+
   it("does not run historical-comment catch-up or queue recovery from the interaction read path", async () => {
     mockIssueService.getById.mockResolvedValue(createIssue({
       status: "in_review",

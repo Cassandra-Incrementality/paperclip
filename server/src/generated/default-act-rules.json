@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "ruling": "PPC-7478 (CEO, 2026-11-14); write-side PPC-7562",
+  "source": "cassandra-brain/scripts/board_card_classifier.py — the ONLY definition. Do not hand-maintain a copy; regenerate with --export-rules.",
+  "default_act_days": 14,
+  "semantics": {
+    "text": "lowercase, then join every author surface of the card with '\\n' — see card_text(): title, summary, payload.{title,prompt,detailsMarkdown,acceptLabel,rejectLabel,submitLabel,rejectReasonLabel}, payload.options[].{label,description}, payload.questions[].{prompt,title} and their options, payload.tasks[].{title,description}",
+    "rule_fires": "ALL patterns of the rule must match somewhere in the text",
+    "order": "RESERVED first in listed order, then AMBIGUOUS; first firing rule wins and is reported as the cause",
+    "buckets": "no reserved/ambiguous match + recommendation -> internal_reversible; no match + no recommendation -> no_recommendation",
+    "may_default_act": "bucket == 'internal_reversible' only",
+    "sibling_rule": "a card is also held when ANY other pending card on the same issue is held — server-side only, needs the issue's other cards",
+    "flags": "case-insensitive, DOTALL (JS: /su + lowercased input)",
+    "dialect_warning": "Python \\b is Unicode-aware, JS \\b is ASCII-only. Do not assume parity — run the conformance suite in the consuming language."
+  },
+  "recommendation": "(?:\\brecommend|\\bmy rec\\b|\\brec:|\\bi suggest\\b|\\bi propose\\b|\\bi['’]d (?:go|pick|choose|do|say)\\b|\\bdefault:|\\bsuggested:|\\bpreferred\\b|\\bmy pick\\b)",
+  "reserved": [
+    {
+      "rule": "protected_merge",
+      "patterns": [
+        "(?:cassandra[-_]saas|mmm[-_]toolkit|production-ecs|ppc-2866)",
+        "(?:\\bmerge|\\bpush\\b|\\bcherry[- ]pick|\\bdeploy|\\brelease\\b|\\btag v|\\bbump (?:the )?pin|\\bff[- ]only)"
+      ]
+    },
+    {
+      "rule": "money",
+      "patterns": [
+        "(?:€|£|\\$\\s?\\d|\\b\\d+\\s?(?:k|m)?\\s?(?:eur|usd)\\b|\\beuros?\\b|\\bpricing\\b|\\bprice[sd]?\\b|\\bquote[sd]?\\b|\\bdiscount|\\bcontract(?:s|ual)?\\b|\\binvoic|\\bbilling\\b|\\brefund|\\bpayment\\b|\\bpay (?:for|out|them|the)\\b|\\bprocure|\\bpurchas|\\bsubscription\\b|\\bretainer\\b|\\bseat licen|\\blicen[cs]e fee\\b|\\bcredit card\\b|\\bpaid plan\\b)"
+      ]
+    },
+    {
+      "rule": "client_facing",
+      "patterns": [
+        "(?:\\bclient[s'’]?\\b|\\bcustomer[s'’]?\\b|\\bprospect|\\bsend (?:it|this|the|to)\\b|\\bcold email|\\boutbound\\b|\\blanding page\\b|\\bpublish\\b|\\bgo[- ]live\\b|\\bpress\\b|\\blinkedin\\b|\\bad copy\\b|\\bcreative\\b|\\bcase stud|\\bdeck\\b|\\bpresentation\\b|\\bproposal to\\b|\\bwebinar\\b|\\bnewsletter\\b|\\bchangelog\\b|\\blaunch comms\\b|\\bblog\\b|\\bwebsite\\b|cassandra\\.app|\\bpublic(?:ly)?\\b|\\bseo\\b|\\bfront door\\b|\\bfree tier\\b|\\bpaywall\\b|\\bsign[- ]?up\\b|\\bpackaging\\b|\\btrial\\b|\\bmonetis|\\bmonetiz|\\bedblad\\b|\\bposhmark\\b|\\bvenchi\\b|\\bgreenpeace\\b|\\btakomo\\b|\\bdeel\\b|\\btanger\\b|\\bmetaflow\\b|\\bwolt\\b|\\bdogfriendly\\b|\\bleadtech\\b|\\bpineberry\\b|\\bsrf\\b|\\ballegro\\b|\\binstilla\\b|\\bcos\\b)"
+      ]
+    },
+    {
+      "rule": "client_model_output",
+      "patterns": [
+        "(?:\\bmodel\\b|\\bmmm\\b|\\breadout\\b|\\bdashboard\\b|\\bdecomp)",
+        "(?:\\broas\\b|\\bmroi\\b|\\blift\\b|\\bcontribution\\b|\\bbaseline\\b|\\bincrementality\\b|\\bapprove\\b|\\bship\\b|\\bre-?run done\\b|\\bready\\b)"
+      ]
+    },
+    {
+      "rule": "credentials",
+      "patterns": [
+        "(?:\\btoken\\b|\\bcredential|\\bsecret[s]?\\b|\\bapi key\\b|\\boauth\\b|\\bscope[s]?\\b|\\bgrant\\b|\\bpermission|\\baccess\\b|\\bpassword\\b|\\bservice account\\b|\\biam\\b|\\ballowlist\\b|\\bwhitelist\\b|\\b2fa\\b|\\bssh key\\b|\\brevoke\\b|\\brotate (?:the )?key|\\bidentity\\b|\\bsso\\b|\\bauth(?:entication|orisation|orization)?\\b)"
+      ]
+    },
+    {
+      "rule": "data_loss",
+      "patterns": [
+        "(?:\\bdelete|\\bdeletion\\b|\\bdrop (?:the )?table|\\bpurge|\\btruncate\\b|\\bwipe\\b|\\bretention\\b|\\bdestroy|\\bhard[- ]delete|\\bremove (?:the )?(?:data|dataset|rows))"
+      ]
+    },
+    {
+      "rule": "people",
+      "patterns": [
+        "(?:\\bhire\\b|\\bhiring\\b|\\bfire (?:the|an)\\b|\\bterminat|\\b(?:un)?pause[ds]?\\b|\\bdeactivate\\b|\\bheadcount\\b|\\bgraduate (?:the )?agent|\\boffboard|\\bretire the (?:role|agent)\\b|\\breassign the (?:role|agent)\\b)"
+      ]
+    }
+  ],
+  "ambiguous": [
+    {
+      "rule": "code_landing",
+      "patterns": [
+        "(?:\\bmerge\\b|\\bcherry[- ]pick|\\bopen (?:a|the) pr\\b|\\bff[- ]only|\\bpush (?:the |my |local )?branch|\\btag v\\d|\\bbump (?:the )?pin)"
+      ]
+    },
+    {
+      "rule": "control_plane",
+      "patterns": [
+        "(?:\\bcontrol[- ]plane\\b|\\brestart\\b|\\blaunchd\\b|\\bdaemon\\b|\\bcrontab\\b|\\bsupervisor\\b|\\bthe host\\b|\\breboot\\b)"
+      ]
+    }
+  ],
+  "conformance": [
+    {
+      "text": "drop the quadratic term from the ranking formula. recommend b: delete the term.",
+      "bucket": "reserved",
+      "rule": "data_loss"
+    },
+    {
+      "text": "re-rank the board display. my pick: ship it — nothing is destroyed and no row is touched.",
+      "bucket": "reserved",
+      "rule": "data_loss"
+    },
+    {
+      "text": "confirm the display fix. recommended: take it. the figure should not be re-quoted.",
+      "bucket": "reserved",
+      "rule": "money"
+    },
+    {
+      "text": "merge the cassandra-saas branch into production-ecs. recommend yes.",
+      "bucket": "reserved",
+      "rule": "protected_merge"
+    },
+    {
+      "text": "rename a helper in mmm_toolkit's docstring glossary. my pick: do it.",
+      "bucket": "internal_reversible",
+      "rule": null
+    },
+    {
+      "text": "merge the branch. recommend yes.",
+      "bucket": "ambiguous",
+      "rule": "code_landing"
+    },
+    {
+      "text": "restart the launchd digest job. recommend yes.",
+      "bucket": "ambiguous",
+      "rule": "control_plane"
+    },
+    {
+      "text": "send the deck to the client on monday. my pick: a.",
+      "bucket": "reserved",
+      "rule": "client_facing"
+    },
+    {
+      "text": "value-first hero above the sign-up form. start here — my pick.",
+      "bucket": "reserved",
+      "rule": "client_facing"
+    },
+    {
+      "text": "the model is ready: meta dominant 36%, baseline 50%. recommend ship.",
+      "bucket": "reserved",
+      "rule": "client_model_output"
+    },
+    {
+      "text": "mint a new api key for the connector. recommend yes.",
+      "bucket": "reserved",
+      "rule": "credentials"
+    },
+    {
+      "text": "pause the reddit agent. recommend yes.",
+      "bucket": "reserved",
+      "rule": "people"
+    },
+    {
+      "text": "re-run the internal budget-shift decomposition on the spend table. my pick: yes.",
+      "bucket": "internal_reversible",
+      "rule": null
+    },
+    {
+      "text": "shall i re-run the internal backfill script?",
+      "bucket": "no_recommendation",
+      "rule": null
+    }
+  ]
+}
