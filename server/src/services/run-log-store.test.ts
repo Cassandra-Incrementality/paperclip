@@ -4,6 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import { Readable } from "node:stream";
 import { createDurableRunLogStore } from "./run-log-store.js";
+import { resetRunLogSecretRedactionCacheForTests } from "./run-log-secret-redaction.js";
 import type { StorageProvider } from "../storage/types.js";
 
 // In-memory StorageProvider stand-in: durable, survives the "pod roll" (local
@@ -49,11 +50,53 @@ function createMemoryProvider() {
 }
 
 let baseDir: string;
+let envFile: string;
+let previousRedactEnv: string | undefined;
+
 beforeEach(async () => {
   baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "run-log-store-test-"));
+  envFile = path.join(baseDir, ".env.ads");
+  await fs.writeFile(envFile, "LINEAR_API_KEY=lin_api_1RVT4nvOArnuaJxLyzwYvYv7QSTrsvASMG2i\n");
+  previousRedactEnv = process.env.RUN_LOG_REDACT_SECRET_FILES;
+  process.env.RUN_LOG_REDACT_SECRET_FILES = envFile;
+  resetRunLogSecretRedactionCacheForTests();
 });
 afterEach(async () => {
+  if (previousRedactEnv === undefined) delete process.env.RUN_LOG_REDACT_SECRET_FILES;
+  else process.env.RUN_LOG_REDACT_SECRET_FILES = previousRedactEnv;
+  resetRunLogSecretRedactionCacheForTests();
   await fs.rm(baseDir, { recursive: true, force: true });
+});
+
+describe("redact-on-write (PPC-7681)", () => {
+  it("never persists a live credential value pasted into an appended chunk", async () => {
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    await store.append(handle, {
+      stream: "stdout",
+      chunk: "token validated: lin_api_1RVT4nvOArnuaJxLyzwYvYv7QSTrsvASMG2i ok",
+      ts: "t1",
+    });
+    const res = await store.read(handle);
+    expect(res.content).not.toContain("lin_api_1RVT4nvOArnuaJxLyzwYvYv7QSTrsvASMG2i");
+    expect(res.content).toContain("***REDACTED:LINEAR_API_KEY***");
+  });
+
+  it("refuses to write (throws) instead of silently persisting plaintext when the credential source is unreadable", async () => {
+    await fs.rm(envFile);
+    resetRunLogSecretRedactionCacheForTests();
+    const { provider } = createMemoryProvider();
+    const store = createDurableRunLogStore({ basePath: baseDir, s3: { provider } });
+    const handle = await store.begin(begin);
+    await expect(
+      store.append(handle, { stream: "stdout", chunk: "anything at all", ts: "t1" }),
+    ).rejects.toThrow();
+    // Nothing was written: the guard's failure mode is loud, not a quiet no-op.
+    const absPath = path.join(baseDir, handle.logRef);
+    const stat = await fs.stat(absPath);
+    expect(stat.size).toBe(0);
+  });
 });
 
 const begin = { companyId: "co1", agentId: "ag1", runId: "run1" };

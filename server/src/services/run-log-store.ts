@@ -5,6 +5,7 @@ import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
 import type { StorageProvider } from "../storage/types.js";
+import { redactKnownSecretValues } from "./run-log-secret-redaction.js";
 
 export type RunLogStoreType = "local_file";
 
@@ -283,11 +284,17 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
 
     async append(handle, event) {
       if (handle.store !== "local_file") return 0;
+      // Redact-on-write (PPC-7681): cross-reference known live credential
+      // values before a single byte reaches disk. This is a hard dependency,
+      // not best-effort -- a failure here must propagate and abort the write
+      // rather than silently persisting an unredacted chunk. See
+      // run-log-secret-redaction.ts for the loud-failure rationale.
+      const redactedChunk = redactKnownSecretValues(event.chunk);
       const absPath = resolveWithin(basePath, handle.logRef);
       const line = JSON.stringify({
         ts: event.ts,
         stream: event.stream,
-        chunk: event.chunk,
+        chunk: redactedChunk,
         // Monotonic per-run sequence so readers can dedupe and order records
         // even when several identical chunks share the same millisecond ts
         // (common for ACP-style token deltas).
