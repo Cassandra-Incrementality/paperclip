@@ -17305,7 +17305,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const livenessRun = finalizedRun;
         await refreshContinuationSummaryForRun(livenessRun, agent);
-        const skipRunIssueComment = parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
+        // A run that ends with the issue still `blocked` and posted no comment of
+        // its own is a guardrail-compliant silent stand-down (heartbeat-triage's
+        // "exactly one PATCH {status: blocked} with no comment"), not a run that
+        // "produced nothing" — the fallback notice below exists for the latter.
+        // Posting it anyway on every such stand-down pollutes the thread and
+        // inflates per-agent comment counts in author-grouped reports (PPC-7703).
+        const isDeliberateBlockedStandDown = livenessRun.livenessState === "blocked";
+        const skipRunIssueComment =
+          parseObject(livenessRun.contextSnapshot).skipIssueComment === true || isDeliberateBlockedStandDown;
         if (issueId && outcome === "succeeded" && !skipRunIssueComment) {
           try {
             const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);

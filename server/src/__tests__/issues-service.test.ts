@@ -422,6 +422,63 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     };
   }
 
+  it("preserves blockedTransitionAt/blockedOwnerNotifiedAt across a harness auto-checkout round trip, but stamps a fresh episode on a genuine new block (PPC-7703)", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, { id: agentId, name: "Coder" }));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked issue that keeps getting auto-checked-out",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    const firstBlock = await svc.update(issueId, { status: "blocked" });
+    expect(firstBlock?.blockedTransitionAt).toBeTruthy();
+    const originalBlockedTransitionAt = firstBlock!.blockedTransitionAt;
+
+    await db
+      .update(issues)
+      .set({ blockedOwnerNotifiedAt: new Date() })
+      .where(eq(issues.id, issueId));
+
+    // The harness auto-checks a `blocked` issue out to `in_progress` for every
+    // wake (shouldAutoCheckoutIssueForWake -> issuesSvc.checkout) before the
+    // agent's run starts; checkout() is a narrow raw update (status/checkout
+    // fields only) that does not touch blockedTransitionAt, unlike a generic
+    // svc.update() status PATCH. Then a guardrail-compliant stand-down
+    // re-asserts the same status through svc.update() with no other write.
+    // Simulate several such cycles.
+    for (let i = 0; i < 5; i += 1) {
+      const checkoutRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: checkoutRunId,
+        companyId,
+        agentId,
+        contextSnapshot: { issueId },
+      });
+      await svc.checkout(issueId, agentId, ["todo", "backlog", "blocked"], checkoutRunId);
+      const reasserted = await svc.update(issueId, { status: "blocked" });
+      expect(reasserted?.blockedTransitionAt).toEqual(originalBlockedTransitionAt);
+      expect(reasserted?.blockedOwnerNotifiedAt).toBeTruthy();
+    }
+
+    // Leaving `blocked` for real clears both stamps, and a later, genuinely new
+    // block stamps a fresh episode rather than reusing the old one.
+    await svc.update(issueId, { status: "in_progress" });
+    const afterRealExit = await svc.getById(issueId);
+    expect(afterRealExit?.blockedTransitionAt).toBeNull();
+    expect(afterRealExit?.blockedOwnerNotifiedAt).toBeNull();
+
+    const secondBlock = await svc.update(issueId, { status: "blocked" });
+    expect(secondBlock?.blockedTransitionAt).toBeTruthy();
+    expect(secondBlock?.blockedTransitionAt).not.toEqual(originalBlockedTransitionAt);
+    expect(secondBlock?.blockedOwnerNotifiedAt).toBeNull();
+  });
+
   it("rejects direct terminated assignees with structured conflict details", async () => {
     const companyId = await seedAssignableAgentCompany();
     const terminatedAgentId = randomUUID();

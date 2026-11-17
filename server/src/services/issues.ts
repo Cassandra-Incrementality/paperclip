@@ -7749,7 +7749,27 @@ export function issueService(db: Db) {
         ...issueData,
         updatedAt: new Date(),
       };
-      if (existing.status !== "blocked" && issueData.status === "blocked") {
+      // The harness auto-checks a `blocked` issue out to `in_progress` for every
+      // wake on it (comment, dependency-resolved, etc.) before the agent's run
+      // starts — see shouldAutoCheckoutIssueForWake. When a guardrail-compliant
+      // stand-down then re-asserts `{"status":"blocked"}`, `existing.status` here
+      // reads "in_progress", not "blocked", even though the issue never left its
+      // current blocked episode. That auto-checkout round trip does not clear
+      // `blockedTransitionAt` (only a genuine exit from `blocked` does, in the
+      // branch below), so a non-null `existing.blockedTransitionAt` is reliable
+      // evidence this is a resumption, not a new episode. Stamping a fresh
+      // `blockedTransitionAt` on every such resumption defeats
+      // `issue_blockers_resolved`'s level-triggered dedup (the key is cycle-aware)
+      // and re-arms `blockedOwnerNotifiedAt`, producing an unbounded wake loop on
+      // any issue that still carries a resolved-but-attached blocker (PPC-7703,
+      // PPC-4419 family). Only stamp a new episode when one is not already open.
+      const resumingOpenBlockedEpisode =
+        existing.status !== "blocked" &&
+        issueData.status === "blocked" &&
+        existing.blockedTransitionAt != null;
+      if (resumingOpenBlockedEpisode) {
+        // Leave blockedTransitionAt / blockedOwnerNotifiedAt as persisted.
+      } else if (existing.status !== "blocked" && issueData.status === "blocked") {
         patch.blockedTransitionAt = patch.updatedAt;
         patch.blockedOwnerNotifiedAt = null;
       } else if (existing.status === "blocked" && issueData.status && issueData.status !== "blocked") {
