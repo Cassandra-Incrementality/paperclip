@@ -307,6 +307,7 @@ export const ISSUE_THREAD_INTERACTION_EFFECTIVE_RESOLVER_POLICY_SOURCES = [
   "requested",
   "company_cap",
   "governed_action",
+  "reserved_repo_action",
 ] as const;
 export type IssueThreadInteractionEffectiveResolverPolicySource =
   (typeof ISSUE_THREAD_INTERACTION_EFFECTIVE_RESOLVER_POLICY_SOURCES)[number];

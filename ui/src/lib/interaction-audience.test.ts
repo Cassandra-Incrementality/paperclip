@@ -179,6 +179,22 @@ describe("describeInteractionAudience", () => {
     );
   });
 
+  it("explains a reserved-repo merge/push clamp", () => {
+    const audience = describeInteractionAudience({
+      interaction: confirmation({
+        requestedResolverPolicy: "anyone",
+        effectiveResolverPolicy: "human_only",
+        effectiveResolverPolicySource: "reserved_repo_action",
+      }),
+    });
+    expect(audience.policy).toBe("human_only");
+    expect(audience.requestedPolicy).toBe("anyone");
+    expect(audience.narrowedBy).toBe("reserved_repo_action");
+    expect(audience.narrowedNote).toBe(
+      "This card asks to merge, push, or apply a patch on a repo the board reserved for a human (PPC-2866), so it stays human-only whatever audience was requested.",
+    );
+  });
+
   it("explains a company cap using both audience labels", () => {
     const audience = describeInteractionAudience({
       interaction: confirmation({

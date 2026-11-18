@@ -256,6 +256,59 @@ export const DEFAULT_RESOLVER_POLICY_BY_KIND: Record<
   request_item_verdicts: "anyone",
 };
 
+/**
+ * Repos PPC-2866 reserves for a human merge/push decision. A card asking to
+ * merge, push, or apply a patch against one of these names a `toolAction`
+ * only when the creator happened to attach one — most merge cards state the
+ * push in free-text `prompt`/`detailsMarkdown` instead, so the structured
+ * `toolAction`/`secretProposal` governed-action check never sees them
+ * (PPC-7737: 62 pending cards, 0 with a `toolAction`).
+ */
+export const RESERVED_HUMAN_MERGE_REPO_NAMES = ["mmm_toolkit", "cassandra-saas", "production-ecs"] as const;
+
+const RESERVED_HUMAN_MERGE_REPO_PATTERN = new RegExp(
+  `\\b(?:${RESERVED_HUMAN_MERGE_REPO_NAMES.map((name) => name.replace(/[-_]/g, "[-_]")).join("|")})\\b`,
+  "i",
+);
+
+const MERGE_OR_PUSH_ACTION_PATTERN =
+  /\b(?:push|merge|git am|apply(?: the)? patch|pull request|pr)\b/i;
+
+/**
+ * Pure text heuristic, deliberately over-inclusive: this is the only signal
+ * available for a merge/push card whose payload carries prose instead of a
+ * structured `toolAction`, and a false positive only costs one extra human
+ * click while a false negative authorizes an unreviewed push to one of the
+ * three reserved repos.
+ */
+export function promptNamesReservedRepoMergeOrPushAction(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return RESERVED_HUMAN_MERGE_REPO_PATTERN.test(text) && MERGE_OR_PUSH_ACTION_PATTERN.test(text);
+}
+
+function confirmationLikePromptText(
+  kind: string,
+  payload: unknown,
+): string | null {
+  if (
+    (kind !== "request_confirmation" && kind !== "request_checkbox_confirmation")
+    || payload === null
+    || typeof payload !== "object"
+  ) {
+    return null;
+  }
+  const prompt = "prompt" in payload && typeof payload.prompt === "string" ? payload.prompt : "";
+  const detailsMarkdown = "detailsMarkdown" in payload && typeof payload.detailsMarkdown === "string"
+    ? payload.detailsMarkdown
+    : "";
+  const combined = `${prompt}\n${detailsMarkdown}`.trim();
+  return combined.length > 0 ? combined : null;
+}
+
+function hasReservedRepoMergeAction(kind: string, payload: unknown): boolean {
+  return promptNamesReservedRepoMergeOrPushAction(confirmationLikePromptText(kind, payload));
+}
+
 const RESOLVER_POLICY_RESTRICTION_RANK: Record<IssueThreadInteractionCanonicalResolverPolicy, number> = {
   anyone: 0,
   not_creator: 1,
@@ -268,6 +321,7 @@ export function resolveInteractionPolicy(args: {
   governance: InteractionResolverGovernance;
   hasToolAction: boolean;
   hasSecretProposal?: boolean;
+  hasReservedRepoMergeAction?: boolean;
 }) {
   const kindGovernance = args.governance[args.kind];
   const requestedPolicyInput = args.requested
@@ -282,6 +336,9 @@ export function resolveInteractionPolicy(args: {
   if (args.hasToolAction || args.hasSecretProposal) {
     effectiveResolverPolicy = "human_only";
     effectiveResolverPolicySource = "governed_action";
+  } else if (args.hasReservedRepoMergeAction) {
+    effectiveResolverPolicy = "human_only";
+    effectiveResolverPolicySource = "reserved_repo_action";
   } else if (kindGovernance?.cap) {
     const cap = normalizeIssueThreadInteractionResolverPolicy(kindGovernance.cap);
     if (RESOLVER_POLICY_RESTRICTION_RANK[cap] > RESOLVER_POLICY_RESTRICTION_RANK[effectiveResolverPolicy]) {
@@ -309,18 +366,23 @@ function resolverActor(actor: InteractionActor) {
 }
 
 function assertInteractionResolutionAllowed(current: IssueThreadInteractionRow, actor: InteractionActor) {
+  const hasStructuredGovernedAction =
+    current.kind === "request_confirmation"
+    && current.payload !== null
+    && typeof current.payload === "object"
+    && (
+      ("toolAction" in current.payload && current.payload.toolAction !== undefined)
+      || ("secretProposal" in current.payload && current.payload.secretProposal !== undefined)
+    );
+  // Recomputed fresh from the stored payload on every resolution attempt,
+  // never trusted from the row's persisted effectiveResolverPolicy: this is
+  // what protects a card created before this check existed, with no data
+  // backfill (PPC-7737).
   return assertIssueThreadInteractionResolverAudience({
     actor: resolverActor(actor),
     interaction: current,
     additionalRestriction: actor.resolverPolicyRestriction,
-    governedAction:
-      current.kind === "request_confirmation"
-      && current.payload !== null
-      && typeof current.payload === "object"
-      && (
-        ("toolAction" in current.payload && current.payload.toolAction !== undefined)
-        || ("secretProposal" in current.payload && current.payload.secretProposal !== undefined)
-      ),
+    governedAction: hasStructuredGovernedAction || hasReservedRepoMergeAction(current.kind, current.payload),
   });
 }
 
@@ -2276,6 +2338,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
         governance,
         hasToolAction: data.kind === "request_confirmation" && data.payload.toolAction !== undefined,
         hasSecretProposal: data.kind === "request_confirmation" && data.payload.secretProposal !== undefined,
+        hasReservedRepoMergeAction: hasReservedRepoMergeAction(data.kind, data.payload),
       });
       const normalizedData = { ...data, resolverPolicy: policy.requestedResolverPolicy };
 

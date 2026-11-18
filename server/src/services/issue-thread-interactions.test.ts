@@ -131,6 +131,78 @@ describe("issueThreadInteractionService", () => {
     });
   });
 
+  it.each([
+    ["Apply patch 0007 to mmm_toolkit?", true],
+    ["5 x `git am --3way` then `git push origin HEAD:main` on cassandra-saas", true],
+    ["Open a PR against production-ecs for the hotfix?", true],
+    ["Should we retire the mmm_toolkit pricing tier?", false],
+    ["Merge the roadmap doc update, no repo involved", false],
+    ["Push the quarterly deck to the shared drive", false],
+    ["", false],
+  ] as const)(
+    "detects reserved-repo merge/push prose: %j -> %s",
+    async (text, expected) => {
+      const { promptNamesReservedRepoMergeOrPushAction } = await import("./issue-thread-interactions.js");
+      expect(promptNamesReservedRepoMergeOrPushAction(text)).toBe(expected);
+    },
+  );
+
+  it("defaults a reserved-repo merge/push confirmation to human-only even with no toolAction", async () => {
+    const { resolveInteractionPolicy } = await import("./issue-thread-interactions.js");
+    expect(resolveInteractionPolicy({
+      kind: "request_confirmation",
+      governance: {},
+      hasToolAction: false,
+      hasReservedRepoMergeAction: true,
+    })).toEqual({
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "inherited",
+      effectiveResolverPolicySource: "reserved_repo_action",
+    });
+  });
+
+  it("refuses an agent accepting a stored-`anyone` merge/push confirmation on a reserved repo (PPC-7737)", async () => {
+    const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
+    const interactionRow = {
+      id: "interaction-merge-card",
+      companyId: "company-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      // Simulates a card created before this guard existed: policy stored as
+      // `anyone` with no toolAction, which is exactly the PPC-7737 shape.
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "anyone",
+      resolverPolicyProvenance: "inherited",
+      effectiveResolverPolicySource: "requested",
+      sourceCommentId: null,
+      sourceRunId: null,
+      title: null,
+      summary: null,
+      addresseeAgentId: null,
+      createdByAgentId: "agent-creator",
+      createdByUserId: null,
+      resolvedByAgentId: null,
+      resolvedByUserId: null,
+      payload: { version: 1, prompt: "Apply patch 0007 to mmm_toolkit?" },
+      result: null,
+      resolvedAt: null,
+      createdAt: new Date("2026-11-18T10:00:00.000Z"),
+      updatedAt: new Date("2026-11-18T10:00:00.000Z"),
+    };
+    const state = createFakeDb({ interactionRow });
+    const svc = issueThreadInteractionService(state.db as never);
+    await expect(svc.acceptInteraction(
+      { id: interactionRow.issueId, companyId: "company-1", projectId: null, goalId: null },
+      interactionRow.id,
+      {},
+      { agentId: "agent-other", runId: "run-999" },
+    )).rejects.toMatchObject({ status: 403, details: { code: "interaction_governed_action_denied" } });
+    expect(state.interactionUpdates).toHaveLength(0);
+  });
+
   it("create reuses an existing interaction for the same idempotency key", async () => {
     const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
 
