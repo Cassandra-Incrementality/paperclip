@@ -78,6 +78,8 @@ import {
   type CompanySearchResponse,
   type ExecutionWorkspace,
   type IssueBlockerDiagnosticFlag,
+  type IssueBlockerDiagnosticHold,
+  type IssueBlockerDiagnosticHoldKind,
   type IssueBlockerDiagnosticIssueSummary,
   type IssueBlockerDiagnosticNode,
   type IssueBlockerDiagnosticsReadiness,
@@ -969,6 +971,35 @@ function blockerDiagnosticLabel(issue: IssueBlockerDiagnosticIssueSummary) {
   return issue.identifier ?? issue.title;
 }
 
+function buildIssueBlockerDiagnosticHold(input: {
+  unresolvedBlockerCount: number;
+  pendingInteractionCount: number;
+  monitorNextCheckAt: Date | string | null;
+  hasUnblockDescriptor: boolean;
+}): IssueBlockerDiagnosticHold {
+  const monitorNextCheckAt = input.monitorNextCheckAt
+    ? new Date(input.monitorNextCheckAt).toISOString()
+    : null;
+  // Precedence mirrors the order the runtime actually wakes an issue on:
+  // a blocker edge (`issue_blockers_resolved`), then a pending interaction
+  // answer, then the monitor timer. An unblock descriptor is deliberately not
+  // a hold — it names an owner, it does not wake anything on its own.
+  const kind: IssueBlockerDiagnosticHoldKind = input.unresolvedBlockerCount > 0
+    ? "blocker_relation"
+    : input.pendingInteractionCount > 0
+      ? "pending_interaction"
+      : monitorNextCheckAt
+        ? "monitor"
+        : "none";
+  return {
+    kind,
+    hasWakePath: kind !== "none",
+    pendingInteractionCount: input.pendingInteractionCount,
+    monitorNextCheckAt,
+    hasUnblockDescriptor: input.hasUnblockDescriptor,
+  };
+}
+
 function buildIssueBlockerDiagnosticsResponse(input: {
   issue: IssueBlockerDiagnosticReadableIssue;
   blockers: IssueBlockerDiagnosticAuthzIssue[];
@@ -981,6 +1012,16 @@ function buildIssueBlockerDiagnosticsResponse(input: {
   };
   truncated: boolean;
   maxBlockers?: number;
+  /**
+   * Omit when the caller has not resolved the non-relation wake paths: the
+   * response then reports `hold: null` (unknown) rather than claiming the
+   * issue has no wake path at all.
+   */
+  hold?: {
+    pendingInteractionCount: number;
+    monitorNextCheckAt: Date | string | null;
+    hasUnblockDescriptor: boolean;
+  };
 }): IssueBlockerDiagnosticsResponse {
   const issue = toIssueBlockerDiagnosticSummary(input.issue);
   const visibleBlockerIds = new Set(input.visibleBlockers.map((blocker) => blocker.id));
@@ -1021,18 +1062,27 @@ function buildIssueBlockerDiagnosticsResponse(input: {
     ? null
     : omittedUnauthorizedBlockerCount;
 
+  const hold = input.hold
+    ? buildIssueBlockerDiagnosticHold({
+        unresolvedBlockerCount: input.readiness.unresolvedBlockerIssueIds.length,
+        ...input.hold,
+      })
+    : null;
+
   return {
     issue,
     diagnosis: buildIssueBlockerDiagnosis({
       issue,
       blockers,
       readiness,
+      hold,
       omittedUnauthorizedBlockerCount: reportedOmittedUnauthorizedBlockerCount,
       truncated: input.truncated,
       maxBlockers: input.maxBlockers ?? ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS,
     }),
     readiness,
     blockers,
+    hold,
     omittedUnauthorizedBlockerCount: reportedOmittedUnauthorizedBlockerCount,
     truncated: input.truncated,
     caps: {
@@ -1045,6 +1095,7 @@ function buildIssueBlockerDiagnosis(input: {
   issue: IssueBlockerDiagnosticIssueSummary;
   blockers: IssueBlockerDiagnosticNode[];
   readiness: IssueBlockerDiagnosticsReadiness | null;
+  hold: IssueBlockerDiagnosticHold | null;
   omittedUnauthorizedBlockerCount: number | null;
   truncated: boolean;
   maxBlockers: number;
@@ -1061,9 +1112,22 @@ function buildIssueBlockerDiagnosis(input: {
     )} are outside this actor's authorization boundary, so this diagnosis only covers visible blockers.`;
   }
   if (input.blockers.length === 0) {
-    return input.issue.status === "blocked"
-      ? `${blockerDiagnosticLabel(input.issue)} is blocked but has no first-class blocker relations.`
-      : null;
+    if (input.issue.status !== "blocked") return null;
+    const label = blockerDiagnosticLabel(input.issue);
+    if (!input.hold) return `${label} is blocked but has no first-class blocker relations.`;
+    // An empty blocker set is not evidence that nothing is holding the issue.
+    // Name the hold that does exist, so a card-held park is never read as a
+    // stranded one — and say so plainly when there really is no wake path.
+    if (input.hold.kind === "pending_interaction") {
+      const count = input.hold.pendingInteractionCount;
+      return `${label} is blocked with no first-class blocker relations, and is held by ${count} pending thread ${
+        count === 1 ? "interaction" : "interactions"
+      }; answering ${count === 1 ? "it" : "them"} is the wake path.`;
+    }
+    if (input.hold.kind === "monitor") {
+      return `${label} is blocked with no first-class blocker relations, and is held by an armed monitor due ${input.hold.monitorNextCheckAt}.`;
+    }
+    return `${label} is blocked with no first-class blocker relations, no pending thread interaction and no armed monitor, so nothing will wake it.`;
   }
 
   const pendingFinalize = input.blockers.find((blocker) => blocker.isPendingFinalize);
@@ -6615,6 +6679,11 @@ export function issueRoutes(
       visibleBlockers,
       readiness: diagnostic.readiness,
       truncated: diagnostic.truncated,
+      hold: {
+        pendingInteractionCount: diagnostic.pendingInteractionCount,
+        monitorNextCheckAt: diagnostic.monitorNextCheckAt,
+        hasUnblockDescriptor: diagnostic.hasUnblockDescriptor,
+      },
     });
 
     logger.info(
@@ -6650,6 +6719,11 @@ export function issueRoutes(
       visibleBlockers,
       readiness: blockerDiagnostic.readiness,
       truncated: blockerDiagnostic.truncated,
+      hold: {
+        pendingInteractionCount: blockerDiagnostic.pendingInteractionCount,
+        monitorNextCheckAt: blockerDiagnostic.monitorNextCheckAt,
+        hasUnblockDescriptor: blockerDiagnostic.hasUnblockDescriptor,
+      },
     });
     const response = buildIssueWakeDiagnosticsResponse({
       issue,

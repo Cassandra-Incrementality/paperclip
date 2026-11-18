@@ -259,11 +259,37 @@ Read `diagnosis` first. It is a deterministic, nullable explanation derived only
       "flags": ["done_but_blocking"]
     }
   ],
+  "hold": {
+    "kind": "blocker_relation",
+    "hasWakePath": true,
+    "pendingInteractionCount": 0,
+    "monitorNextCheckAt": null,
+    "hasUnblockDescriptor": false
+  },
   "omittedUnauthorizedBlockerCount": 0,
   "truncated": false,
   "caps": { "maxBlockers": 100 }
 }
 ```
+
+**An empty `blockers` array does not mean nothing is holding the issue.** A blocker
+relation is only one of three legitimate holds: the `blocked` transition also
+accepts a pending thread interaction, and an armed monitor wakes the issue on a
+timer. Read `hold` before concluding an issue is stranded.
+
+| `hold.kind` | What is holding the issue | `diagnosis` reads |
+| --- | --- | --- |
+| `blocker_relation` | An unresolved blocker edge | `… is blocked by <blocker>, which is <status>.` |
+| `pending_interaction` | One or more pending cards; answering them is the wake path | `… is blocked with no first-class blocker relations, and is held by N pending thread interactions; answering them is the wake path.` |
+| `monitor` | An armed monitor, due at `hold.monitorNextCheckAt` | `… is held by an armed monitor due <ISO>.` |
+| `none` | Nothing — no edge, no pending card, no monitor | `… so nothing will wake it.` |
+
+`hold.hasWakePath === false` is the only structured signal that an issue is
+genuinely stranded. `hold.hasUnblockDescriptor` is reported for completeness and
+is **not** a wake path: a descriptor names an owner, it wakes nothing by itself.
+`hold` is `null` on callers that do not resolve the non-relation wake paths
+(currently the per-node blocker diagnostics inside `/diagnostics/subtree`) —
+`null` means *unknown*, never *absent*, so never read it as "stranded".
 
 Security and bounds:
 
@@ -1246,7 +1272,7 @@ Terminal states: `done`, `cancelled`
 | GET    | `/api/companies/:companyId/issues` | List issues, sorted by priority. Filters: `?status=`, `?assigneeAgentId=`, `?assigneeUserId=`, `?projectId=`, `?labelId=`, `?q=` (full-text search across title, identifier, description, comments) |
 | GET    | `/api/issues/:issueId`             | Issue details + ancestors                                                                |
 | GET    | `/api/issues/:issueId/heartbeat-context` | Compact context for heartbeat: issue state, ancestor summaries, comment cursor  |
-| GET    | `/api/issues/:issueId/diagnostics/blockers` | Read-only blocker diagnostic with `diagnosis`, readiness, and bounded anomaly flags |
+| GET    | `/api/issues/:issueId/diagnostics/blockers` | Read-only blocker diagnostic with `diagnosis`, readiness, `hold` (what is actually holding a `blocked` issue: blocker edge / pending card / monitor / nothing), and bounded anomaly flags |
 | GET    | `/api/issues/:issueId/diagnostics/wakes` | Read-only wake-history diagnostic with `diagnosis`, bounded events, and Case-B inference |
 | GET    | `/api/issues/:issueId/diagnostics/subtree` | Read-only subtree diagnostic combining visible child, blocker, and wake edges with `diagnosis` |
 | POST   | `/api/companies/:companyId/issues` | Create issue (supports `blockedByIssueIds: string[]` for dependencies)                   |

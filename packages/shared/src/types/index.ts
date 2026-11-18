@@ -617,6 +617,8 @@ export type {
   IssueWorkMode,
   IssueAssigneeAdapterOverrides,
   IssueBlockerDiagnosticFlag,
+  IssueBlockerDiagnosticHold,
+  IssueBlockerDiagnosticHoldKind,
   IssueBlockerDiagnosticIssueSummary,
   IssueBlockerDiagnosticNode,
   IssueBlockerDiagnosticsReadiness,

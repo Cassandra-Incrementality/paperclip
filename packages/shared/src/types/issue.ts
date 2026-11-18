@@ -252,11 +252,37 @@ export interface IssueBlockerDiagnosticsReadiness {
   pendingFinalizeBlockerCount: number;
 }
 
+/**
+ * What is actually holding a `blocked` issue, in the server's own order of
+ * precedence. A blocker relation is only one of three legitimate holds: the
+ * `blocked` precondition also accepts a pending thread interaction, and an
+ * armed monitor keeps an issue live on a timer. Reported so a reader can tell
+ * "correctly held, waiting on a decision card" from "nothing can wake this"
+ * without inferring it from an empty `blockers` array.
+ */
+export type IssueBlockerDiagnosticHoldKind =
+  | "blocker_relation"
+  | "pending_interaction"
+  | "monitor"
+  | "none";
+
+export interface IssueBlockerDiagnosticHold {
+  kind: IssueBlockerDiagnosticHoldKind;
+  /** True when at least one of the three wake paths exists. */
+  hasWakePath: boolean;
+  pendingInteractionCount: number;
+  monitorNextCheckAt: string | null;
+  /** Whether a named unblock owner/action is attached. Never a wake path by itself. */
+  hasUnblockDescriptor: boolean;
+}
+
 export interface IssueBlockerDiagnosticsResponse {
   issue: IssueBlockerDiagnosticIssueSummary;
   diagnosis: string | null;
   readiness: IssueBlockerDiagnosticsReadiness | null;
   blockers: IssueBlockerDiagnosticNode[];
+  /** `null` when the caller did not resolve the non-relation wake paths (unknown, not absent). */
+  hold: IssueBlockerDiagnosticHold | null;
   omittedUnauthorizedBlockerCount: number | null;
   truncated: boolean;
   caps: {

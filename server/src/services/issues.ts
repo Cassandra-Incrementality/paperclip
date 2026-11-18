@@ -6154,7 +6154,12 @@ export function issueService(db: Db) {
       maxBlockers = ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS,
     ) => {
       const issue = await db
-        .select({ id: issues.id, companyId: issues.companyId })
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          unblockDescriptor: issues.unblockDescriptor,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -6189,10 +6194,31 @@ export function issueService(db: Db) {
 
       const readiness = await listIssueDependencyReadinessMap(db, issue.companyId, [issue.id]);
 
+      // A blocker relation is not the only thing that can legitimately hold an
+      // issue `blocked`: the transition's own precondition accepts a pending
+      // thread interaction, and an armed monitor wakes the issue on a timer.
+      // Both are invisible to `issue_relations`, so an empty blocker set reads
+      // identically for a card-held issue and for a stranded one unless the
+      // diagnostics report them.
+      const pendingInteractionCount = await db
+        .select({ id: issueThreadInteractions.id })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            eq(issueThreadInteractions.companyId, issue.companyId),
+            eq(issueThreadInteractions.issueId, issue.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ),
+        )
+        .then((rows) => rows.length);
+
       return {
         blockers: blockerRows.slice(0, cappedMax) as IssueBlockerDiagnosticsIssueRow[],
         readiness: readiness.get(issue.id) ?? createIssueDependencyReadiness(issue.id),
         truncated: blockerRows.length > cappedMax,
+        pendingInteractionCount,
+        monitorNextCheckAt: issue.monitorNextCheckAt ?? null,
+        hasUnblockDescriptor: Boolean(issue.unblockDescriptor),
       };
     },
 

@@ -988,6 +988,8 @@ export type {
   IssueChanges,
   IssueAssigneeAdapterOverrides,
   IssueBlockerDiagnosticFlag,
+  IssueBlockerDiagnosticHold,
+  IssueBlockerDiagnosticHoldKind,
   IssueBlockerDiagnosticIssueSummary,
   IssueBlockerDiagnosticNode,
   IssueBlockerDiagnosticsReadiness,

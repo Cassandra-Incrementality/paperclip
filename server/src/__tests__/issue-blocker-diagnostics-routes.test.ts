@@ -9,6 +9,7 @@ import {
   createDb,
   heartbeatRuns,
   issueRelations,
+  issueThreadInteractions,
   issues,
   projects,
 } from "@paperclipai/db";
@@ -387,5 +388,177 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.omittedUnauthorizedBlockerCount).toBeNull();
     expect(res.body.diagnosis).toContain("truncated at 100 blockers");
     expect(res.body.caps).toEqual({ maxBlockers: 100 });
+  });
+
+  // An empty blocker set is not evidence that nothing is holding the issue:
+  // the `blocked` transition's own precondition accepts a pending thread
+  // interaction, and a monitor wakes the issue on a timer. Both were invisible
+  // here, so a correctly card-held park and a stranded one returned the same
+  // diagnosis — the mechanism behind a sweep that reported four correctly
+  // blocked issues as dead parks.
+  it("reports a pending interaction as the hold on a blocked issue with no blocker relations", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Waiting on a decision card",
+      status: "blocked",
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId: company.id,
+      issueId: issue.id,
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { title: "Answer this to unblock" },
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.blockers).toEqual([]);
+    expect(res.body.hold).toEqual({
+      kind: "pending_interaction",
+      hasWakePath: true,
+      pendingInteractionCount: 1,
+      monitorNextCheckAt: null,
+      hasUnblockDescriptor: false,
+    });
+    expect(res.body.diagnosis).toContain("held by 1 pending thread interaction");
+    expect(res.body.diagnosis).not.toContain("nothing will wake it");
+  });
+
+  it("reports an armed monitor as the hold when there is no blocker relation or pending interaction", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const monitorNextCheckAt = new Date("2026-12-01T09:00:00.000Z");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Waiting on a timer",
+      status: "blocked",
+    });
+    await db.update(issues).set({ monitorNextCheckAt }).where(eq(issues.id, issue.id));
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.hold).toEqual({
+      kind: "monitor",
+      hasWakePath: true,
+      pendingInteractionCount: 0,
+      monitorNextCheckAt: monitorNextCheckAt.toISOString(),
+      hasUnblockDescriptor: false,
+    });
+    expect(res.body.diagnosis).toContain("held by an armed monitor");
+  });
+
+  it("says plainly that nothing will wake a blocked issue with no blocker, interaction or monitor", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Stranded",
+      status: "blocked",
+    });
+    // A resolved card is not a hold, and an unblock descriptor is not a wake
+    // path — neither may rescue this issue from the `none` verdict.
+    await db.insert(issueThreadInteractions).values({
+      companyId: company.id,
+      issueId: issue.id,
+      kind: "request_confirmation",
+      status: "resolved",
+      payload: { title: "Already answered" },
+    });
+    await db.update(issues).set({
+      unblockDescriptor: { owner: "board", action: "Someone please look at this" },
+    }).where(eq(issues.id, issue.id));
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.hold).toEqual({
+      kind: "none",
+      hasWakePath: false,
+      pendingInteractionCount: 0,
+      monitorNextCheckAt: null,
+      hasUnblockDescriptor: true,
+    });
+    expect(res.body.diagnosis).toContain("nothing will wake it");
+  });
+
+  it("reports the blocker relation as the hold when one is unresolved", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const blocker = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Upstream",
+      status: "in_progress",
+    });
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Downstream",
+      status: "blocked",
+    });
+    await blockIssue(db, company.id, blocker.id, root.id);
+    // A pending card alongside a live blocker edge must not outrank it.
+    await db.insert(issueThreadInteractions).values({
+      companyId: company.id,
+      issueId: root.id,
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { title: "Also waiting on a card" },
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${root.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.hold).toMatchObject({
+      kind: "blocker_relation",
+      hasWakePath: true,
+      pendingInteractionCount: 1,
+    });
+    expect(res.body.diagnosis).toContain("is blocked by");
+  });
+
+  it("leaves the subtree endpoint's wording untouched, since it does not resolve non-relation wake paths", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Card-held parent",
+      status: "blocked",
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId: company.id,
+      issueId: issue.id,
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { title: "Answer this to unblock" },
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/subtree`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const node = res.body.nodes.find(
+      (candidate: { issue: { id: string } }) => candidate.issue.id === issue.id,
+    );
+    // The subtree node does not resolve interactions or monitors, so it makes
+    // no hold claim at all and keeps the pre-existing wording. A caller that
+    // cannot see the non-relation wake paths must never be handed a sentence
+    // saying nothing will wake the issue — that is the defect being fixed.
+    expect(node.hold).toBeUndefined();
+    expect(node.diagnosis).toBe(
+      `${node.issue.identifier ?? node.issue.title} is blocked but has no first-class blocker relations.`,
+    );
   });
 });
