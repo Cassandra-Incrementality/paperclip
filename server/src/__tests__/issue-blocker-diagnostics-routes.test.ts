@@ -528,6 +528,50 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.diagnosis).toContain("is blocked by");
   });
 
+  it("reports hasWakePath true one hop deep, even when the blocker itself is stranded", async () => {
+    // Pins the documented limitation rather than asserting desired behaviour.
+    // `hasWakePath` is scoped to THIS issue: `kind` resolves to
+    // `blocker_relation` on `unresolvedBlockerCount > 0` alone, so an issue
+    // behind a blocker that is itself held by nothing still reports `true`.
+    // That is intentional — resolving the chain would turn a per-issue read
+    // into a graph walk per request — but it is a trap for a liveness sweep,
+    // which is why it is tested and documented in `api-reference.md` instead of
+    // left to be rediscovered. Measured on the Cassandra board 2026-11-18: 57
+    // issues of this exact shape report `true` while nothing can ever wake
+    // them, on top of the 252 that report `false` (PPC-7742).
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    // The leaf: blocked, no card, no monitor, no blocker of its own.
+    const strandedBlocker = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Stranded upstream",
+      status: "blocked",
+    });
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Downstream of a dead end",
+      status: "blocked",
+    });
+    await blockIssue(db, company.id, strandedBlocker.id, root.id);
+
+    const app = createApp(db, boardActor(company));
+    const leafRes = await request(app)
+      .get(`/api/issues/${strandedBlocker.id}/diagnostics/blockers`);
+    expect(leafRes.status, JSON.stringify(leafRes.body)).toBe(200);
+    expect(leafRes.body.hold).toMatchObject({ kind: "none", hasWakePath: false });
+
+    const res = await request(app).get(`/api/issues/${root.id}/diagnostics/blockers`);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.hold).toMatchObject({
+      kind: "blocker_relation",
+      // One hop: true despite the chain terminating in `hasWakePath: false`.
+      hasWakePath: true,
+      pendingInteractionCount: 0,
+    });
+  });
+
   it("leaves the subtree endpoint's wording untouched, since it does not resolve non-relation wake paths", async () => {
     const company = await seedCompany(db);
     const project = await seedProject(db, company.id, "Core");

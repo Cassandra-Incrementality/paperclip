@@ -284,12 +284,32 @@ timer. Read `hold` before concluding an issue is stranded.
 | `monitor` | An armed monitor, due at `hold.monitorNextCheckAt` | `… is held by an armed monitor due <ISO>.` |
 | `none` | Nothing — no edge, no pending card, no monitor | `… so nothing will wake it.` |
 
-`hold.hasWakePath === false` is the only structured signal that an issue is
-genuinely stranded. `hold.hasUnblockDescriptor` is reported for completeness and
+`hold.hasWakePath === false` is the structured signal that an issue holds no wake
+path **of its own**. `hold.hasUnblockDescriptor` is reported for completeness and
 is **not** a wake path: a descriptor names an owner, it wakes nothing by itself.
 `hold` is `null` on callers that do not resolve the non-relation wake paths
 (currently the per-node blocker diagnostics inside `/diagnostics/subtree`) —
 `null` means *unknown*, never *absent*, so never read it as "stranded".
+
+⚠️ **`hasWakePath` is one hop deep — it is not "this issue can move".** `kind`
+resolves to `blocker_relation` on `unresolvedBlockerCount > 0` alone, so an issue
+reports `hasWakePath: true` whenever an open blocker edge exists, including when
+that blocker is itself held by nothing. `issue_blockers_resolved` fires only when
+a blocker *closes*, so a chain terminating in a card-less, monitor-less,
+blocker-less issue never wakes anything behind it.
+
+Measured on the Cassandra board 2026-11-18: **252** open issues hold no wake path
+at all, and a further **57** are blocker-held with every chain terminating dead —
+all 57 return `hasWakePath: true`. So a liveness sweep keyed on
+`hasWakePath === false` finds 252 of 309, and the 57 it misses are the worst
+class: they read as supervised and are not (median age over 100 days; their
+terminal leaves concentrate on 18 DevOps, 15 unassigned, 12 CTO). To get the true
+figure, walk the blocker DAG client-side and treat an issue as stranded when
+every open blocker in its closure is itself stranded; stop the walk at `todo` /
+`in_progress` blockers, which assert the assignee owes the move. Reference
+implementation: `cassandra-brain` `scripts/board_liveness_audit.py:resolve_strands`
+(`ea83f02e`). Transitive resolution is deliberately out of scope for this
+endpoint — it would turn a per-issue read into a graph walk per request.
 
 Security and bounds:
 

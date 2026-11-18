@@ -268,7 +268,26 @@ export type IssueBlockerDiagnosticHoldKind =
 
 export interface IssueBlockerDiagnosticHold {
   kind: IssueBlockerDiagnosticHoldKind;
-  /** True when at least one of the three wake paths exists. */
+  /**
+   * True when at least one of the three wake paths exists **on this issue**.
+   *
+   * ⚠️ Scoped to one hop, and a liveness sweep must not read it as "this issue
+   * can move". `kind: "blocker_relation"` is decided by
+   * `unresolvedBlockerCount > 0` alone, so this is `true` whenever an open
+   * blocker edge exists — even when that blocker is itself held by nothing.
+   * `issue_blockers_resolved` only fires when a blocker *closes*, so a chain
+   * terminating in an issue with no card, no monitor and no live blocker of its
+   * own is a wake path to nowhere.
+   *
+   * Measured on the Cassandra board 2026-11-18: 252 open issues have no wake
+   * path at all, and a further **57** are blocker-held with every chain
+   * terminating dead — all 57 report `hasWakePath: true` here. A sweep keyed on
+   * `hasWakePath: false` therefore finds 252 of 309 (PPC-7742). Resolving the
+   * chain transitively is deliberately NOT done in this endpoint: it would turn
+   * a per-issue read into a graph walk. Callers needing the true figure walk the
+   * blocker DAG themselves — reference implementation in `cassandra-brain`
+   * `scripts/board_liveness_audit.py:resolve_strands` (`ea83f02e`).
+   */
   hasWakePath: boolean;
   pendingInteractionCount: number;
   monitorNextCheckAt: string | null;
