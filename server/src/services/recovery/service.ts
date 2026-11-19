@@ -3259,6 +3259,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     const recoveryCause = resolveStrandedRecoveryCause(input.latestRun, input.recoveryCause);
+
+    // PPC-7845: the missing-state cause has a "no actionable owner" outcome
+    // (see `noActionableOwnerForMissingDisposition` below) that deliberately
+    // leaves the issue's status untouched -- a correct terminal disposition
+    // for a board_escalation_no_takeover_v1 recovery with no real owner. That
+    // left the issue sitting in the sweep's own candidate query
+    // (`reconcileStrandedAssignedIssues` selects status in
+    // todo/in_progress/in_review) forever, so every ~15s sweep tick re-ran
+    // this whole function and re-logged `issue.successful_run_handoff_escalated`
+    // for the identical already-settled outcome: 2,929 events in 15h at a
+    // flat 240/hr, from just 3 issues and 4 recovery-action rows that were
+    // never new detections, only the same action re-firing. Latch it: once
+    // this exact (issue, cause, latestRun) triple has already resolved to "no
+    // actionable owner", skip reprocessing entirely until a new run
+    // supersedes the recorded one. A run that *did* get first-class blockers
+    // attached moves the issue to `blocked` and drops out of the candidate
+    // query on its own (see PPC-2301 in the issue), so this check only needs
+    // to compare against the run id recorded on the active action.
+    if (recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON) {
+      const existingAction = await recoveryActionsSvc.getActiveForIssue(input.issue.companyId, input.issue.id);
+      const existingEvidence = parseObject(existingAction?.evidence);
+      const alreadySettledForThisRun = Boolean(existingAction) &&
+        existingAction!.cause === SUCCESSFUL_RUN_MISSING_STATE_REASON &&
+        !existingAction!.ownerAgentId &&
+        (existingEvidence.latestRunId ?? null) === (input.latestRun?.id ?? null);
+      if (alreadySettledForThisRun) return null;
+    }
+
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
       previousStatus: input.previousStatus,

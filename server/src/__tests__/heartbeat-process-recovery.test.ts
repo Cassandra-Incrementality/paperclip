@@ -4061,6 +4061,90 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(activity.some((event) => event.action === "issue.successful_run_handoff_escalated")).toBe(true);
   });
 
+  it("latches the no-actionable-owner missing-state outcome instead of re-escalating every sweep tick (PPC-7845)", async () => {
+    const { issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    // First sweep tick: genuinely no actionable owner, so the issue is left
+    // in_progress and notified -- the designed board_escalation_no_takeover_v1
+    // outcome.
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.successfulRunHandoffEscalated).toBe(0);
+    expect(first.successfulRunHandoffNotifiedWithoutBlocking).toBe(1);
+
+    const actionsAfterFirst = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actionsAfterFirst).toHaveLength(1);
+    expect(actionsAfterFirst[0]?.attemptCount).toBe(1);
+
+    const activityAfterFirst = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    const escalatedAfterFirst = activityAfterFirst.filter(
+      (event) => event.action === "issue.successful_run_handoff_escalated",
+    );
+    expect(escalatedAfterFirst).toHaveLength(1);
+    const commentsAfterFirst = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(commentsAfterFirst).toHaveLength(1);
+
+    // Second (and third) sweep tick on the identical unchanged run: PPC-7845's
+    // bug re-ran the whole escalation every ~15s forever (240/hr, 2,929
+    // events/15h) because nothing latched the outcome of the first tick. The
+    // fix must make every subsequent tick on the same run a pure no-op.
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.successfulRunHandoffEscalated).toBe(0);
+    expect(second.successfulRunHandoffNotifiedWithoutBlocking).toBe(0);
+    expect(second.skipped).toBeGreaterThanOrEqual(1);
+
+    const third = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(third.successfulRunHandoffEscalated).toBe(0);
+    expect(third.successfulRunHandoffNotifiedWithoutBlocking).toBe(0);
+
+    const actionsAfterRepeat = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actionsAfterRepeat).toHaveLength(1);
+    // The recovery action must not keep accumulating attempts for a
+    // condition that was already settled -- that unbounded attemptCount
+    // growth is the same symptom as the activity_log write-volume loop.
+    expect(actionsAfterRepeat[0]?.attemptCount).toBe(1);
+
+    const activityAfterRepeat = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    const escalatedAfterRepeat = activityAfterRepeat.filter(
+      (event) => event.action === "issue.successful_run_handoff_escalated",
+    );
+    expect(escalatedAfterRepeat).toHaveLength(1);
+
+    const commentsAfterRepeat = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(commentsAfterRepeat).toHaveLength(1);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("in_progress");
+  });
+
   it("escalates an exhausted successful handoff run that still leaves no disposition", async () => {
     const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
