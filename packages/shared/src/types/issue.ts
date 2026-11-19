@@ -297,9 +297,12 @@ export interface IssueBlockerDiagnosticHold {
    */
   pendingInteractionHumanOnlyCount: number;
   /**
-   * Of `pendingInteractionCount`, how many have
-   * `resolverPolicyProvenance !== "explicit"`, i.e. nobody ever stated who may
-   * answer them and the policy was defaulted.
+   * Of `pendingInteractionCount`, how many have nobody asserting who may answer
+   * them: `resolverPolicyProvenance !== "explicit"` (the requester did not say)
+   * **and** `effectiveResolverPolicySource === "requested"` (the platform did
+   * not impose one either). A `company_cap`, `governed_action` or
+   * `reserved_repo_action` source IS an assertion, just not the requester's, so
+   * a card gated that way counts as classified.
    *
    * ⚠️ `kind: "pending_interaction"` means a card holds the issue. It does NOT
    * mean the card's ask is answerable by the party it points at, and those two

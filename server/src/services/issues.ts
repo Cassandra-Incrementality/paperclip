@@ -6209,6 +6209,7 @@ export function issueService(db: Db) {
           id: issueThreadInteractions.id,
           effectiveResolverPolicy: issueThreadInteractions.effectiveResolverPolicy,
           resolverPolicyProvenance: issueThreadInteractions.resolverPolicyProvenance,
+          effectiveResolverPolicySource: issueThreadInteractions.effectiveResolverPolicySource,
         })
         .from(issueThreadInteractions)
         .where(
@@ -6227,8 +6228,15 @@ export function issueService(db: Db) {
         pendingInteractionHumanOnlyCount: pendingInteractionRows.filter(
           (row) => row.effectiveResolverPolicy === "human_only",
         ).length,
+        // "Nobody asserted who may answer" needs both halves: the requester did
+        // not say (`provenance !== "explicit"`) AND the platform did not impose
+        // one either. A company cap, a governed action or a reserved repo action
+        // IS an assertion, just not the requester's, so a card gated that way is
+        // classified and must not be reported as unverified.
         pendingInteractionUnclassifiedCount: pendingInteractionRows.filter(
-          (row) => row.resolverPolicyProvenance !== "explicit",
+          (row) =>
+            row.resolverPolicyProvenance !== "explicit" &&
+            row.effectiveResolverPolicySource === "requested",
         ).length,
         monitorNextCheckAt: issue.monitorNextCheckAt ?? null,
         hasUnblockDescriptor: Boolean(issue.unblockDescriptor),

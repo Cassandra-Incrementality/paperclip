@@ -300,9 +300,13 @@ capability only a human has is correct and must be left alone, while a hold
 waiting on a human for something the holder could do itself is a park that never
 clears. `hold.pendingInteractionHumanOnlyCount` counts the cards that actually
 assert `effectiveResolverPolicy: "human_only"`;
-`hold.pendingInteractionUnclassifiedCount` counts those whose
-`resolverPolicyProvenance` is not `explicit`, i.e. nobody ever stated who may
-answer. When the latter equals `pendingInteractionCount`, the addressee is
+`hold.pendingInteractionUnclassifiedCount` counts those nobody asserted a
+resolver for at all — `resolverPolicyProvenance` is not `explicit` (the requester
+did not say) **and** `effectiveResolverPolicySource` is `requested` (the platform
+did not impose one either). A `company_cap`, `governed_action` or
+`reserved_repo_action` source is an assertion, just not the requester's, so a
+card gated that way counts as classified. When the unclassified count equals
+`pendingInteractionCount`, the addressee is
 **unverified, not wrong** — read the ask against the capability it demands.
 
 Measured 2026-11-19 across the 8 live card-held issues on the Cassandra board:

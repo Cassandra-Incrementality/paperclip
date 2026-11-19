@@ -505,6 +505,46 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.diagnosis).toContain("held by 1 pending thread interaction");
   });
 
+  // A platform-imposed policy is still an assertion, just not the requester's.
+  // `effectiveResolverPolicySource` grows over time (`company_cap`,
+  // `governed_action`, `reserved_repo_action`, …); each new source must keep
+  // counting as classified, or the unverified wording fires on cards the
+  // platform itself gated.
+  it("counts a platform-imposed resolver policy as classified, not unverified", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Held by a governed card",
+      status: "blocked",
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId: company.id,
+      issueId: issue.id,
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { title: "Push to a protected branch" },
+      // The requester never classified it; the platform did.
+      requestedResolverPolicy: "anyone",
+      resolverPolicyProvenance: "inherited",
+      effectiveResolverPolicy: "human_only",
+      effectiveResolverPolicySource: "governed_action",
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.hold).toMatchObject({
+      kind: "pending_interaction",
+      pendingInteractionCount: 1,
+      pendingInteractionHumanOnlyCount: 1,
+      pendingInteractionUnclassifiedCount: 0,
+    });
+    expect(res.body.diagnosis).not.toContain("who must answer is unverified");
+  });
+
   it("reports an armed monitor as the hold when there is no blocker relation or pending interaction", async () => {
     const company = await seedCompany(db);
     const project = await seedProject(db, company.id, "Core");
