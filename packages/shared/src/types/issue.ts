@@ -289,6 +289,32 @@ export interface IssueBlockerDiagnosticHold {
    * `scripts/board_liveness_audit.py:resolve_strands` (`ea83f02e`).
    */
   hasWakePath: boolean;
+  /**
+   * Of the wake paths that exist, whether any fires **without a third party
+   * choosing to act** — i.e. an armed monitor. A card is not a clock: a pending
+   * interaction wakes the issue on accept and on reject, and **never on
+   * expiry**, so a card-only hold is live exactly as long as its holder keeps
+   * electing to answer. `hasWakePath` cannot express that difference, and it is
+   * the difference between a hold that decays and one that does not.
+   *
+   * ⚠️ On a `blocked` issue this is **always** `false`, by construction, not by
+   * accident: `issueAllowsMonitor`
+   * (`server/src/services/issue-execution-policy.ts:283`) permits a monitor
+   * only on `in_progress`/`in_review`, and any write moving the status
+   * elsewhere clears it under `clearReason: "invalid_status"` and nulls
+   * `monitorNextCheckAt` (`:1234`). Measured against the live Cassandra board
+   * 2026-11-19: **0 of 446** `blocked` issues carry a `monitorNextCheckAt`. So
+   * every card-held `blocked` issue is an answer-only hold, and cannot be given
+   * a clock while it stays `blocked` — the remedy is to move the issue to
+   * `in_review` and arm one, never to re-file the card (PPC-7742).
+   *
+   * Consequence for a liveness sweep: `hasWakePath: true` with
+   * `wakesOnTimer: false` is the signature of a hold that nothing will ever
+   * re-raise on its own. That is not a dead park — the ask may be perfectly
+   * legitimate — but it is not a durable one either, and the two were
+   * indistinguishable in this payload until this field existed.
+   */
+  wakesOnTimer: boolean;
   pendingInteractionCount: number;
   /**
    * Of `pendingInteractionCount`, how many carry

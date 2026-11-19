@@ -996,6 +996,12 @@ function buildIssueBlockerDiagnosticHold(input: {
   return {
     kind,
     hasWakePath: kind !== "none",
+    // Reported independently of `kind` on purpose: a card and a monitor can
+    // both be armed, `kind` can only name one, and the precedence above makes
+    // it name the card. Keying liveness on `kind === "monitor"` would therefore
+    // rate a card-with-clock the same as a card alone — the defect this field
+    // exists to close.
+    wakesOnTimer: monitorNextCheckAt !== null,
     pendingInteractionCount: input.pendingInteractionCount,
     pendingInteractionHumanOnlyCount: input.pendingInteractionHumanOnlyCount,
     pendingInteractionUnclassifiedCount: input.pendingInteractionUnclassifiedCount,
@@ -1126,19 +1132,43 @@ function buildIssueBlockerDiagnosis(input: {
     // stranded one — and say so plainly when there really is no wake path.
     if (input.hold.kind === "pending_interaction") {
       const count = input.hold.pendingInteractionCount;
-      const base = `${label} is blocked with no first-class blocker relations, and is held by ${count} pending thread ${
-        count === 1 ? "interaction" : "interactions"
-      }; answering ${count === 1 ? "it" : "them"} is the wake path.`;
+      const sentences = [
+        `${label} is blocked with no first-class blocker relations, and is held by ${count} pending thread ${
+          count === 1 ? "interaction" : "interactions"
+        }; answering ${count === 1 ? "it" : "them"} is the wake path.`,
+      ];
+      // A card is not a clock. Naming the card and stopping is the same error
+      // this endpoint exists to fix, one level down: a pending interaction
+      // wakes on accept and on reject and never on expiry, so a card-only hold
+      // does not decay and nothing re-raises it if its holder goes quiet. On
+      // `blocked` that is the only possible shape — `issueAllowsMonitor`
+      // forbids a clock outside `in_progress`/`in_review` — so say what the
+      // reader can actually do about it rather than implying a timer exists.
+      sentences.push(
+        input.hold.wakesOnTimer
+          ? `An armed monitor due ${input.hold.monitorNextCheckAt} re-raises it meanwhile.`
+          : `${
+              count === 1 ? "A pending interaction wakes" : "Pending interactions wake"
+            } on an answer and never on expiry, and a monitor cannot be armed while the issue stays blocked, so nothing will re-raise this on its own; move it to in_review and arm one if the decision needs a clock.`,
+      );
       // A card is a legitimate hold, but nothing above says whether its ask
       // needs a human at all. Say when that was never asserted, so a reader
       // checks the payload instead of trusting the park.
       if (input.hold.pendingInteractionUnclassifiedCount === count) {
-        return `${base} No resolver policy was ever set on ${
-          count === 1 ? "it" : "any of them"
-        }, so who must answer is unverified; read the ask against the capability it needs before treating this as a human gate.`;
+        sentences.push(
+          `No resolver policy was ever set on ${
+            count === 1 ? "it" : "any of them"
+          }, so who must answer is unverified; read the ask against the capability it needs before treating this as a human gate.`,
+        );
       }
-      return base;
+      return sentences.join(" ");
     }
+    // Defensive, and measured unreachable on `blocked`: 0 of 446 blocked issues
+    // on the live board carry a `monitorNextCheckAt` (2026-11-19), because the
+    // transition that sets `blocked` clears the monitor. Kept rather than
+    // dropped so that if the runtime ever permits a clock here, the diagnosis
+    // reports it instead of falling through to "nothing will wake it" — the
+    // false dead park this endpoint exists to prevent.
     if (input.hold.kind === "monitor") {
       return `${label} is blocked with no first-class blocker relations, and is held by an armed monitor due ${input.hold.monitorNextCheckAt}.`;
     }

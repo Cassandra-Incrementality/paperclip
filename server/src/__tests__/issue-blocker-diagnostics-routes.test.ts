@@ -421,6 +421,8 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.hold).toEqual({
       kind: "pending_interaction",
       hasWakePath: true,
+      // A card is not a clock: it wakes on accept and reject, never on expiry.
+      wakesOnTimer: false,
       pendingInteractionCount: 1,
       // Seeded without a resolver policy, which is how cards are written in
       // practice: 7 of the 8 live card-held issues on the board read this way.
@@ -545,6 +547,125 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.diagnosis).not.toContain("who must answer is unverified");
   });
 
+  // A card is not a clock, and reporting the card and stopping is this
+  // endpoint's own defect one level down: a pending interaction wakes on accept
+  // and on reject and NEVER on expiry, so a card-only hold does not decay and
+  // nothing re-raises it if its holder goes quiet. `kind` cannot carry this —
+  // the precedence makes it say `pending_interaction` whether or not a clock is
+  // also armed — so `wakesOnTimer` is reported independently (PPC-7742).
+  it("distinguishes a card-only hold from a card with an armed monitor", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const monitorNextCheckAt = new Date("2026-12-01T09:00:00.000Z");
+
+    const cardOnly = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Held by a card with no clock",
+      status: "blocked",
+    });
+    const cardAndClock = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Held by a card with a clock",
+      status: "in_review",
+    });
+    for (const issueId of [cardOnly.id, cardAndClock.id]) {
+      await db.insert(issueThreadInteractions).values({
+        companyId: company.id,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        payload: { title: "Answer this to unblock" },
+      });
+    }
+    await db.update(issues).set({ monitorNextCheckAt }).where(eq(issues.id, cardAndClock.id));
+
+    const app = request(createApp(db, boardActor(company)));
+    const cardOnlyRes = await app.get(`/api/issues/${cardOnly.id}/diagnostics/blockers`);
+    const cardAndClockRes = await app.get(`/api/issues/${cardAndClock.id}/diagnostics/blockers`);
+
+    expect(cardOnlyRes.status, JSON.stringify(cardOnlyRes.body)).toBe(200);
+    expect(cardAndClockRes.status, JSON.stringify(cardAndClockRes.body)).toBe(200);
+
+    // Both are card-held, so `kind` and `hasWakePath` are identical — which is
+    // exactly why neither can be used to tell a decaying hold from a durable
+    // one. `wakesOnTimer` is the field that separates them.
+    expect(cardOnlyRes.body.hold.kind).toBe("pending_interaction");
+    expect(cardAndClockRes.body.hold.kind).toBe("pending_interaction");
+    expect(cardOnlyRes.body.hold.hasWakePath).toBe(true);
+    expect(cardAndClockRes.body.hold.hasWakePath).toBe(true);
+    expect(cardOnlyRes.body.hold.wakesOnTimer).toBe(false);
+    expect(cardAndClockRes.body.hold.wakesOnTimer).toBe(true);
+    expect(cardAndClockRes.body.hold.monitorNextCheckAt).toBe(monitorNextCheckAt.toISOString());
+  });
+
+  // The remedy a reader can actually act on is "move it to in_review and arm a
+  // clock", never "re-file the card" — so the diagnosis has to say that the
+  // card alone will not re-raise the issue, and why a monitor is absent.
+  it("says a card-held blocked issue will not re-raise itself and names the remedy", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Held by a card with no clock",
+      status: "blocked",
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId: company.id,
+      issueId: issue.id,
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { title: "Land the fix?" },
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.diagnosis).toContain("held by 1 pending thread interaction");
+    expect(res.body.diagnosis).toContain("never on expiry");
+    expect(res.body.diagnosis).toContain("nothing will re-raise this on its own");
+    expect(res.body.diagnosis).toContain("move it to in_review and arm one");
+    // It is still a legitimate hold, not a dead park: the `none` wording that
+    // drove the 2026-11-15 false-dead-park sweep must not appear here.
+    expect(res.body.diagnosis).not.toContain("nothing will wake it");
+  });
+
+  // Guard against the opposite over-correction: when a clock IS armed beside
+  // the card, the decay wording must not fire.
+  it("does not claim a card-held issue is clockless when a monitor is armed", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const monitorNextCheckAt = new Date("2026-12-01T09:00:00.000Z");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Held by a card beside a clock",
+      status: "blocked",
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId: company.id,
+      issueId: issue.id,
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { title: "Answer this to unblock" },
+    });
+    await db.update(issues).set({ monitorNextCheckAt }).where(eq(issues.id, issue.id));
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.hold).toMatchObject({ kind: "pending_interaction", wakesOnTimer: true });
+    expect(res.body.diagnosis).toContain("held by 1 pending thread interaction");
+    expect(res.body.diagnosis).toContain(
+      `An armed monitor due ${monitorNextCheckAt.toISOString()} re-raises it meanwhile.`,
+    );
+    expect(res.body.diagnosis).not.toContain("nothing will re-raise this on its own");
+  });
+
   it("reports an armed monitor as the hold when there is no blocker relation or pending interaction", async () => {
     const company = await seedCompany(db);
     const project = await seedProject(db, company.id, "Core");
@@ -564,6 +685,7 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.hold).toEqual({
       kind: "monitor",
       hasWakePath: true,
+      wakesOnTimer: true,
       pendingInteractionCount: 0,
       pendingInteractionHumanOnlyCount: 0,
       pendingInteractionUnclassifiedCount: 0,
@@ -602,6 +724,7 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(res.body.hold).toEqual({
       kind: "none",
       hasWakePath: false,
+      wakesOnTimer: false,
       pendingInteractionCount: 0,
       // A resolved card is not counted, so it cannot make the hold look
       // classified either.
