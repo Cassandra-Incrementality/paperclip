@@ -290,6 +290,37 @@ export interface IssueBlockerDiagnosticHold {
    */
   hasWakePath: boolean;
   pendingInteractionCount: number;
+  /**
+   * Of `pendingInteractionCount`, how many carry
+   * `effectiveResolverPolicy: "human_only"` — the only first-class assertion
+   * that the hold needs a human at all.
+   */
+  pendingInteractionHumanOnlyCount: number;
+  /**
+   * Of `pendingInteractionCount`, how many have
+   * `resolverPolicyProvenance !== "explicit"`, i.e. nobody ever stated who may
+   * answer them and the policy was defaulted.
+   *
+   * ⚠️ `kind: "pending_interaction"` means a card holds the issue. It does NOT
+   * mean the card's ask is answerable by the party it points at, and those two
+   * need opposite actions: a hold waiting on a capability only a human has is
+   * correct and must be left alone, while a hold waiting on a human for
+   * something the holder could do itself is a park that will never clear. This
+   * count is how far the data can take a reader — when it equals
+   * `pendingInteractionCount`, the addressee is *unverified*, not wrong.
+   *
+   * Measured on the Cassandra board 2026-11-19 across the 8 live card-held
+   * issues: 7 of 8 read `inherited`/`anyone`, including all six whose asks are
+   * genuinely human-only (rotate a credential, push to a protected branch,
+   * approve a PR, paste into a read-only sheet, apply a board-gated patch, make
+   * a design call). So `anyone` here is an *unset* field, never evidence that an
+   * agent can resolve the card. Deciding whether an ask is correctly addressed
+   * means reading its payload against the capability it demands, which is a
+   * judgement and deliberately not modelled here (PPC-7742). The cost of not
+   * surfacing it: card `c4d536ab` sat 74 days self-labelled "board decision,
+   * agents do not resolve" on an ask its own holder was responsible for.
+   */
+  pendingInteractionUnclassifiedCount: number;
   monitorNextCheckAt: string | null;
   /** Whether a named unblock owner/action is attached. Never a wake path by itself. */
   hasUnblockDescriptor: boolean;

@@ -974,6 +974,8 @@ function blockerDiagnosticLabel(issue: IssueBlockerDiagnosticIssueSummary) {
 function buildIssueBlockerDiagnosticHold(input: {
   unresolvedBlockerCount: number;
   pendingInteractionCount: number;
+  pendingInteractionHumanOnlyCount: number;
+  pendingInteractionUnclassifiedCount: number;
   monitorNextCheckAt: Date | string | null;
   hasUnblockDescriptor: boolean;
 }): IssueBlockerDiagnosticHold {
@@ -995,6 +997,8 @@ function buildIssueBlockerDiagnosticHold(input: {
     kind,
     hasWakePath: kind !== "none",
     pendingInteractionCount: input.pendingInteractionCount,
+    pendingInteractionHumanOnlyCount: input.pendingInteractionHumanOnlyCount,
+    pendingInteractionUnclassifiedCount: input.pendingInteractionUnclassifiedCount,
     monitorNextCheckAt,
     hasUnblockDescriptor: input.hasUnblockDescriptor,
   };
@@ -1019,6 +1023,8 @@ function buildIssueBlockerDiagnosticsResponse(input: {
    */
   hold?: {
     pendingInteractionCount: number;
+    pendingInteractionHumanOnlyCount: number;
+    pendingInteractionUnclassifiedCount: number;
     monitorNextCheckAt: Date | string | null;
     hasUnblockDescriptor: boolean;
   };
@@ -1120,9 +1126,18 @@ function buildIssueBlockerDiagnosis(input: {
     // stranded one — and say so plainly when there really is no wake path.
     if (input.hold.kind === "pending_interaction") {
       const count = input.hold.pendingInteractionCount;
-      return `${label} is blocked with no first-class blocker relations, and is held by ${count} pending thread ${
+      const base = `${label} is blocked with no first-class blocker relations, and is held by ${count} pending thread ${
         count === 1 ? "interaction" : "interactions"
       }; answering ${count === 1 ? "it" : "them"} is the wake path.`;
+      // A card is a legitimate hold, but nothing above says whether its ask
+      // needs a human at all. Say when that was never asserted, so a reader
+      // checks the payload instead of trusting the park.
+      if (input.hold.pendingInteractionUnclassifiedCount === count) {
+        return `${base} No resolver policy was ever set on ${
+          count === 1 ? "it" : "any of them"
+        }, so who must answer is unverified; read the ask against the capability it needs before treating this as a human gate.`;
+      }
+      return base;
     }
     if (input.hold.kind === "monitor") {
       return `${label} is blocked with no first-class blocker relations, and is held by an armed monitor due ${input.hold.monitorNextCheckAt}.`;
@@ -6681,6 +6696,8 @@ export function issueRoutes(
       truncated: diagnostic.truncated,
       hold: {
         pendingInteractionCount: diagnostic.pendingInteractionCount,
+        pendingInteractionHumanOnlyCount: diagnostic.pendingInteractionHumanOnlyCount,
+        pendingInteractionUnclassifiedCount: diagnostic.pendingInteractionUnclassifiedCount,
         monitorNextCheckAt: diagnostic.monitorNextCheckAt,
         hasUnblockDescriptor: diagnostic.hasUnblockDescriptor,
       },
@@ -6721,6 +6738,8 @@ export function issueRoutes(
       truncated: blockerDiagnostic.truncated,
       hold: {
         pendingInteractionCount: blockerDiagnostic.pendingInteractionCount,
+        pendingInteractionHumanOnlyCount: blockerDiagnostic.pendingInteractionHumanOnlyCount,
+        pendingInteractionUnclassifiedCount: blockerDiagnostic.pendingInteractionUnclassifiedCount,
         monitorNextCheckAt: blockerDiagnostic.monitorNextCheckAt,
         hasUnblockDescriptor: blockerDiagnostic.hasUnblockDescriptor,
       },

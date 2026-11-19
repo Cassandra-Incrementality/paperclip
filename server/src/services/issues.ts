@@ -6200,8 +6200,16 @@ export function issueService(db: Db) {
       // Both are invisible to `issue_relations`, so an empty blocker set reads
       // identically for a card-held issue and for a stranded one unless the
       // diagnostics report them.
-      const pendingInteractionCount = await db
-        .select({ id: issueThreadInteractions.id })
+      // `effectiveResolverPolicy` and `resolverPolicyProvenance` come back with
+      // the count because "a card holds this" and "only a human can answer that
+      // card" are different facts, and a liveness reader needs the second one:
+      // see `IssueBlockerDiagnosticHold.pendingInteractionUnclassifiedCount`.
+      const pendingInteractionRows = await db
+        .select({
+          id: issueThreadInteractions.id,
+          effectiveResolverPolicy: issueThreadInteractions.effectiveResolverPolicy,
+          resolverPolicyProvenance: issueThreadInteractions.resolverPolicyProvenance,
+        })
         .from(issueThreadInteractions)
         .where(
           and(
@@ -6209,14 +6217,19 @@ export function issueService(db: Db) {
             eq(issueThreadInteractions.issueId, issue.id),
             eq(issueThreadInteractions.status, "pending"),
           ),
-        )
-        .then((rows) => rows.length);
+        );
 
       return {
         blockers: blockerRows.slice(0, cappedMax) as IssueBlockerDiagnosticsIssueRow[],
         readiness: readiness.get(issue.id) ?? createIssueDependencyReadiness(issue.id),
         truncated: blockerRows.length > cappedMax,
-        pendingInteractionCount,
+        pendingInteractionCount: pendingInteractionRows.length,
+        pendingInteractionHumanOnlyCount: pendingInteractionRows.filter(
+          (row) => row.effectiveResolverPolicy === "human_only",
+        ).length,
+        pendingInteractionUnclassifiedCount: pendingInteractionRows.filter(
+          (row) => row.resolverPolicyProvenance !== "explicit",
+        ).length,
         monitorNextCheckAt: issue.monitorNextCheckAt ?? null,
         hasUnblockDescriptor: Boolean(issue.unblockDescriptor),
       };

@@ -422,11 +422,87 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
       kind: "pending_interaction",
       hasWakePath: true,
       pendingInteractionCount: 1,
+      // Seeded without a resolver policy, which is how cards are written in
+      // practice: 7 of the 8 live card-held issues on the board read this way.
+      pendingInteractionHumanOnlyCount: 0,
+      pendingInteractionUnclassifiedCount: 1,
       monitorNextCheckAt: null,
       hasUnblockDescriptor: false,
     });
     expect(res.body.diagnosis).toContain("held by 1 pending thread interaction");
     expect(res.body.diagnosis).not.toContain("nothing will wake it");
+  });
+
+  // "A card holds this" and "only a human can answer that card" are different
+  // facts, and they call for opposite actions: a capability-gated hold must be
+  // left alone, while a hold waiting on a human for something the holder could
+  // do itself never clears. `c4d536ab` sat 74 days self-labelled "board
+  // decision, agents do not resolve" on an ask its own holder owned (PPC-7742).
+  it("says who must answer is unverified when no resolver policy was ever set on the card", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Held by an unclassified card",
+      status: "blocked",
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId: company.id,
+      issueId: issue.id,
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { title: "Board decision, agents do not resolve" },
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.hold).toMatchObject({
+      kind: "pending_interaction",
+      hasWakePath: true,
+      pendingInteractionCount: 1,
+      pendingInteractionHumanOnlyCount: 0,
+      pendingInteractionUnclassifiedCount: 1,
+    });
+    // The prose in the payload is the filer's self-label, not evidence.
+    expect(res.body.diagnosis).toContain("who must answer is unverified");
+    expect(res.body.diagnosis).toContain("held by 1 pending thread interaction");
+  });
+
+  it("does not call the addressee unverified when the card declares human_only explicitly", async () => {
+    const company = await seedCompany(db);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Held by a classified card",
+      status: "blocked",
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId: company.id,
+      issueId: issue.id,
+      kind: "request_confirmation",
+      status: "pending",
+      payload: { title: "Rotate the credential" },
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      resolverPolicyProvenance: "explicit",
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/blockers`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.hold).toMatchObject({
+      kind: "pending_interaction",
+      pendingInteractionCount: 1,
+      pendingInteractionHumanOnlyCount: 1,
+      pendingInteractionUnclassifiedCount: 0,
+    });
+    expect(res.body.diagnosis).not.toContain("who must answer is unverified");
+    expect(res.body.diagnosis).toContain("held by 1 pending thread interaction");
   });
 
   it("reports an armed monitor as the hold when there is no blocker relation or pending interaction", async () => {
@@ -449,6 +525,8 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
       kind: "monitor",
       hasWakePath: true,
       pendingInteractionCount: 0,
+      pendingInteractionHumanOnlyCount: 0,
+      pendingInteractionUnclassifiedCount: 0,
       monitorNextCheckAt: monitorNextCheckAt.toISOString(),
       hasUnblockDescriptor: false,
     });
@@ -485,6 +563,10 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
       kind: "none",
       hasWakePath: false,
       pendingInteractionCount: 0,
+      // A resolved card is not counted, so it cannot make the hold look
+      // classified either.
+      pendingInteractionHumanOnlyCount: 0,
+      pendingInteractionUnclassifiedCount: 0,
       monitorNextCheckAt: null,
       hasUnblockDescriptor: true,
     });

@@ -263,6 +263,8 @@ Read `diagnosis` first. It is a deterministic, nullable explanation derived only
     "kind": "blocker_relation",
     "hasWakePath": true,
     "pendingInteractionCount": 0,
+    "pendingInteractionHumanOnlyCount": 0,
+    "pendingInteractionUnclassifiedCount": 0,
     "monitorNextCheckAt": null,
     "hasUnblockDescriptor": false
   },
@@ -280,7 +282,7 @@ timer. Read `hold` before concluding an issue is stranded.
 | `hold.kind` | What is holding the issue | `diagnosis` reads |
 | --- | --- | --- |
 | `blocker_relation` | An unresolved blocker edge | `… is blocked by <blocker>, which is <status>.` |
-| `pending_interaction` | One or more pending cards; answering them is the wake path | `… is blocked with no first-class blocker relations, and is held by N pending thread interactions; answering them is the wake path.` |
+| `pending_interaction` | One or more pending cards; answering them is the wake path | `… is blocked with no first-class blocker relations, and is held by N pending thread interactions; answering them is the wake path.` — plus `No resolver policy was ever set on any of them, so who must answer is unverified; …` when `pendingInteractionUnclassifiedCount === pendingInteractionCount` |
 | `monitor` | An armed monitor, due at `hold.monitorNextCheckAt` | `… is held by an armed monitor due <ISO>.` |
 | `none` | Nothing — no edge, no pending card, no monitor | `… so nothing will wake it.` |
 
@@ -290,6 +292,29 @@ is **not** a wake path: a descriptor names an owner, it wakes nothing by itself.
 `hold` is `null` on callers that do not resolve the non-relation wake paths
 (currently the per-node blocker diagnostics inside `/diagnostics/subtree`) —
 `null` means *unknown*, never *absent*, so never read it as "stranded".
+
+⚠️ **A card-held hold does not mean the card's ask is answerable by whoever it
+points at.** `kind: "pending_interaction"` says a card holds the issue, nothing
+more, and the two cases underneath need opposite actions: a hold waiting on a
+capability only a human has is correct and must be left alone, while a hold
+waiting on a human for something the holder could do itself is a park that never
+clears. `hold.pendingInteractionHumanOnlyCount` counts the cards that actually
+assert `effectiveResolverPolicy: "human_only"`;
+`hold.pendingInteractionUnclassifiedCount` counts those whose
+`resolverPolicyProvenance` is not `explicit`, i.e. nobody ever stated who may
+answer. When the latter equals `pendingInteractionCount`, the addressee is
+**unverified, not wrong** — read the ask against the capability it demands.
+
+Measured 2026-11-19 across the 8 live card-held issues on the Cassandra board:
+**7 of 8** read `inherited` / `anyone`, and that includes all six whose asks are
+genuinely human-only (rotate a credential, push to a protected branch, approve a
+PR, paste into a read-only sheet, apply a board-gated patch, make a design call).
+So `anyone` here is an **unset** field and never evidence that an agent can
+resolve the card. Whether an ask is correctly addressed is a judgement on its
+payload and is deliberately not modelled. The cost of leaving it unsurfaced: card
+`c4d536ab` sat **74 days** self-labelled "board decision, agents do not resolve"
+on an ask its own holder was responsible for — and it was the oldest of the
+seven, because a stale ask decays toward the holder.
 
 ⚠️ **`hasWakePath` is one hop deep — it is not "this issue can move".** `kind`
 resolves to `blocker_relation` on `unresolvedBlockerCount > 0` alone, so an issue
@@ -303,7 +328,10 @@ at all, and a further **57** are blocker-held with every chain terminating dead 
 all 57 return `hasWakePath: true`. So a liveness sweep keyed on
 `hasWakePath === false` finds 252 of 309, and the 57 it misses are the worst
 class: they read as supervised and are not (median age over 100 days; their
-terminal leaves concentrate on 18 DevOps, 15 unassigned, 12 CTO). To get the true
+terminal leaves concentrate on 18 DevOps, 15 human-owned, 12 CTO — "human-owned"
+not "unassigned": every one has `assigneeUserId` set, so no agent heartbeat fires
+but a person owns it, which makes it an inbox item and not a sweepable dead park).
+To get the true
 figure, walk the blocker DAG client-side and treat an issue as stranded when
 every open blocker in its closure is itself stranded; stop the walk at `todo` /
 `in_progress` blockers, which assert the assignee owes the move. Reference
