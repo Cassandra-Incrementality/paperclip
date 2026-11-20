@@ -9730,7 +9730,21 @@ export function issueRoutes(
     if (normalizedAssigneeAgentId !== undefined) {
       updateFields.assigneeAgentId = normalizedAssigneeAgentId;
     }
-    const monitorChanged = monitorPoliciesEqual(previousExecutionPolicy, nextExecutionPolicy) === false;
+    // previousExecutionPolicy.monitor reads null once a scheduled monitor has
+    // ticked even once (buildIssueMonitorTriggeredPatch strips monitor back
+    // out of executionPolicy on every firing), so comparing policy objects
+    // alone misses an explicit `{"executionPolicy":{"monitor":null}}` clear
+    // request against a monitor that is actually still live on
+    // monitorNextCheckAt (PPC-7964). Treat the request as touching the
+    // monitor whenever it names the key and a monitor is currently armed.
+    const requestNamesMonitorKey =
+      req.body.executionPolicy !== undefined &&
+      req.body.executionPolicy !== null &&
+      typeof req.body.executionPolicy === "object" &&
+      "monitor" in (req.body.executionPolicy as Record<string, unknown>);
+    const monitorChanged =
+      monitorPoliciesEqual(previousExecutionPolicy, nextExecutionPolicy) === false ||
+      (requestNamesMonitorKey && existing.monitorNextCheckAt != null);
     await assertCanManageIssueMonitor(
       access,
       req,

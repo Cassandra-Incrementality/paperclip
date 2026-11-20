@@ -1084,7 +1084,15 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
     stagePatch.executionState !== undefined
       ? parseIssueExecutionState(stagePatch.executionState)
       : existingState;
-  const invalidReason = input.policy?.monitor
+  // A monitor's source of truth once scheduled is monitorNextCheckAt /
+  // executionState.monitor, not policy.monitor: buildIssueMonitorTriggeredPatch
+  // strips the monitor back out of executionPolicy on every firing (PPC-7964),
+  // so a live, ticking monitor almost always reaches this function with
+  // policy.monitor and previousPolicy.monitor both null. Gate on the derived
+  // live state too, or an invalid-status transition (e.g. -> blocked) and an
+  // explicit executionPolicy.monitor:null clear both silently no-op.
+  const hasLiveMonitor = currentMonitorState?.status === "scheduled";
+  const invalidReason = input.policy?.monitor || hasLiveMonitor
     ? monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId)
     : null;
 
@@ -1129,17 +1137,22 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
         targetMonitorState = buildScheduledMonitorState(currentMonitorState, input.policy.monitor);
       }
     }
-  } else if (previousPolicy?.monitor) {
-    patch.monitorNextCheckAt = null;
-    patch.monitorWakeRequestedAt = null;
-    targetMonitorState = buildClearedMonitorState({
-      previous: currentMonitorState,
-      clearReason:
-        input.monitorExplicitlyUpdated
-          ? "manual"
-          : monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId) ?? "manual",
-      clearedAt: new Date(),
-    });
+  } else if (previousPolicy?.monitor || hasLiveMonitor) {
+    // Only clear when something actually calls for it: an invalid
+    // status/assignee for the live monitor, or the caller explicitly asked
+    // to clear it (executionPolicy.monitor: null). Otherwise a routine
+    // status/comment PATCH that doesn't touch executionPolicy at all would
+    // wipe a healthy, valid monitor every time it ran.
+    if (invalidReason || input.monitorExplicitlyUpdated) {
+      patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy ?? previousPolicy ?? null);
+      patch.monitorNextCheckAt = null;
+      patch.monitorWakeRequestedAt = null;
+      targetMonitorState = buildClearedMonitorState({
+        previous: currentMonitorState,
+        clearReason: invalidReason ?? "manual",
+        clearedAt: new Date(),
+      });
+    }
   }
 
   if (stagePatch.executionState !== undefined || !monitorStatesEqual(currentMonitorState, targetMonitorState)) {

@@ -698,6 +698,74 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  it("clears a live monitor on an explicit executionPolicy.monitor:null PATCH (PPC-7964)", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-7965",
+      title: "Ticked monitor, manual clear",
+      executionPolicy: null,
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "scheduled",
+          nextCheckAt: "2026-11-24T09:00:00.000Z",
+          lastTriggeredAt: null,
+          attemptCount: 0,
+          notes: null,
+          scheduledBy: "assignee",
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorAttemptCount: 0,
+      monitorNextCheckAt: new Date("2026-11-24T09:00:00.000Z"),
+      monitorLastTriggeredAt: null,
+      monitorNotes: null,
+      monitorScheduledBy: "assignee",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ executionPolicy: { monitor: null } });
+
+    expect(res.status).toBe(200);
+    const [calledId, calledPatch] = mockIssueService.update.mock.calls[0] as [string, Record<string, unknown>];
+    expect(calledId).toBe("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    expect(calledPatch).toMatchObject({
+      monitorNextCheckAt: null,
+      executionState: {
+        monitor: {
+          status: "cleared",
+          clearReason: "manual",
+        },
+      },
+    });
+  });
+
   it("allows board-authored in_review repair updates without a review path", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",

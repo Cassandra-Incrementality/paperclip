@@ -1792,6 +1792,111 @@ describe("issue execution policy transitions", () => {
         }),
       ).toThrow("Monitor bounds are already exhausted");
     });
+
+    it("clears a live monitor on an invalid-status transition even when executionPolicy was already stripped (PPC-7964)", () => {
+      // Mirrors production: buildIssueMonitorTriggeredPatch strips the
+      // monitor back out of executionPolicy on every firing, so a
+      // ticking monitor reaches here with policy/previousPolicy both null
+      // and only the flat monitor* columns + executionState.monitor still
+      // live. A plain status PATCH to "blocked" must still clear it.
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: null,
+          executionState: {
+            status: "idle",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            monitor: {
+              status: "scheduled",
+              nextCheckAt: "2026-11-20T22:42:11.444Z",
+              lastTriggeredAt: "2026-11-20T22:12:11.444Z",
+              attemptCount: 5,
+              notes: "stale notes",
+              scheduledBy: "assignee",
+              clearedAt: null,
+              clearReason: null,
+            },
+          },
+          monitorAttemptCount: 5,
+          monitorNextCheckAt: new Date("2026-11-20T22:42:11.444Z"),
+          monitorLastTriggeredAt: new Date("2026-11-20T22:12:11.444Z"),
+          monitorNotes: "stale notes",
+          monitorScheduledBy: "assignee",
+        },
+        policy: null,
+        previousPolicy: null,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        monitor: {
+          status: "cleared",
+          clearReason: "invalid_status",
+        },
+      });
+    });
+
+    it("clears a live monitor on an explicit executionPolicy.monitor:null request even though policy/previousPolicy were already stripped (PPC-7964)", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: null,
+          executionState: {
+            status: "idle",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            monitor: {
+              status: "scheduled",
+              nextCheckAt: "2026-11-24T09:00:00.000Z",
+              lastTriggeredAt: null,
+              attemptCount: 0,
+              notes: null,
+              scheduledBy: "assignee",
+              clearedAt: null,
+              clearReason: null,
+            },
+          },
+          monitorAttemptCount: 0,
+          monitorNextCheckAt: new Date("2026-11-24T09:00:00.000Z"),
+          monitorLastTriggeredAt: null,
+          monitorNotes: null,
+          monitorScheduledBy: "assignee",
+        },
+        policy: null,
+        previousPolicy: null,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: true,
+      });
+
+      expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        monitor: {
+          status: "cleared",
+          clearReason: "manual",
+        },
+      });
+    });
   });
 });
 
