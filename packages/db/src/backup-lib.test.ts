@@ -85,18 +85,29 @@ describe("runDatabaseBackup minFreeBytes guard", () => {
     async () => {
       const backupDir = createTempDir("paperclip-db-backup-guard-");
 
+      // Sanity check the import itself: esbuild/vitest resolves a missing
+      // named export to `undefined` rather than throwing, which would make
+      // every assertion below vacuously pass (instanceof undefined throws,
+      // toThrow(undefined) degrades to "any throw").
+      expect(InsufficientBackupDiskSpaceError).toBeTypeOf("function");
+
       // No real postgres needed: the guard must trip before the connection
       // is ever used, so an unreachable connection string proves that.
-      await expect(
-        runDatabaseBackup({
+      let caughtError: unknown;
+      try {
+        await runDatabaseBackup({
           connectionString: "postgres://unreachable:unreachable@127.0.0.1:1/nonexistent",
           backupDir,
           retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
           filenamePrefix: "paperclip-test",
           minFreeBytes: Number.MAX_SAFE_INTEGER,
-        }),
-      ).rejects.toThrow(InsufficientBackupDiskSpaceError);
+        });
+      } catch (error) {
+        caughtError = error;
+      }
 
+      expect(caughtError).toBeInstanceOf(InsufficientBackupDiskSpaceError);
+      expect((caughtError as InsufficientBackupDiskSpaceError).message).toContain("below the");
       expect(fs.readdirSync(backupDir)).toEqual([]);
     },
     10_000,
