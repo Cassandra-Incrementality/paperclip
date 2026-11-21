@@ -2253,6 +2253,48 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
           await touchIssue(db, issueId);
         }
         await emitResolvedInteractionsTelemetry(db, expired);
+        // Same silent-loss gap as the live create() path (PPC-7997): this
+        // sweep expires a duplicate pending card the moment it finds one,
+        // with no wake to tell its creator the card it was waiting on is gone.
+        if (opts.wakeup) {
+          for (const supersededInteraction of expired) {
+            if (supersededInteraction.continuationPolicy !== "wake_assignee") continue;
+            if (!supersededInteraction.createdByAgentId) continue;
+            const replacementInteractionId =
+              (supersededInteraction.result as { supersededByInteractionId?: string } | null)
+                ?.supersededByInteractionId ?? null;
+            await opts.wakeup(supersededInteraction.createdByAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: {
+                issueId: supersededInteraction.issueId,
+                interactionId: supersededInteraction.id,
+                interactionKind: supersededInteraction.kind,
+                interactionStatus: supersededInteraction.status,
+                sourceCommentId: supersededInteraction.sourceCommentId ?? null,
+                sourceRunId: supersededInteraction.sourceRunId ?? null,
+                mutation: "interaction",
+                resolutionSource: "superseded_by_newer_request",
+                ...(replacementInteractionId ? { supersededByInteractionId: replacementInteractionId } : {}),
+              },
+              idempotencyKey: `interaction:${supersededInteraction.id}:expired:superseded`,
+              requestedByActorType: "system",
+              requestedByActorId: "system:interaction-supersede-sweep",
+              contextSnapshot: {
+                issueId: supersededInteraction.issueId,
+                taskId: supersededInteraction.issueId,
+                interactionId: supersededInteraction.id,
+                interactionKind: supersededInteraction.kind,
+                interactionStatus: supersededInteraction.status,
+                wakeReason: "issue_commented",
+                source: "issue.interaction.superseded_sweep",
+              },
+            }).catch((err) => {
+              console.error("[paperclip] Failed to wake creator on interaction supersede sweep", err);
+            });
+          }
+        }
       }
       return { expired: expired.length };
     },
@@ -2484,7 +2526,49 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
 
       await touchIssue(db, issue.id);
       if (superseded.length > 0) {
-        await emitResolvedInteractionsTelemetry(db, superseded.map(hydrateInteraction));
+        const hydratedSuperseded = superseded.map(hydrateInteraction);
+        await emitResolvedInteractionsTelemetry(db, hydratedSuperseded);
+        // A superseded card is destroyed, not merely resolved -- it never reaches
+        // `accepted`/`rejected`, so with no wake here its creator learns the ask is
+        // gone only by diffing interaction state by hand (PPC-7997). Mirrors the
+        // merged-PR-sweep wake above; `wake_assignee_on_accept` stays silent here,
+        // matching its existing silence on reject.
+        if (opts.wakeup) {
+          for (const supersededInteraction of hydratedSuperseded) {
+            if (supersededInteraction.continuationPolicy !== "wake_assignee") continue;
+            if (!supersededInteraction.createdByAgentId) continue;
+            await opts.wakeup(supersededInteraction.createdByAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: {
+                issueId: issue.id,
+                interactionId: supersededInteraction.id,
+                interactionKind: supersededInteraction.kind,
+                interactionStatus: supersededInteraction.status,
+                sourceCommentId: supersededInteraction.sourceCommentId ?? null,
+                sourceRunId: supersededInteraction.sourceRunId ?? null,
+                mutation: "interaction",
+                resolutionSource: "superseded_by_newer_request",
+                supersededByInteractionId: created.id,
+              },
+              idempotencyKey: `interaction:${supersededInteraction.id}:expired:superseded`,
+              requestedByActorType: "system",
+              requestedByActorId: "system:interaction-supersede",
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                interactionId: supersededInteraction.id,
+                interactionKind: supersededInteraction.kind,
+                interactionStatus: supersededInteraction.status,
+                wakeReason: "issue_commented",
+                source: "issue.interaction.superseded",
+              },
+            }).catch((err) => {
+              console.error("[paperclip] Failed to wake creator on interaction supersede", err);
+            });
+          }
+        }
       }
       const interaction = hydrateInteraction(created);
       emitInteractionCreatedTelemetry({

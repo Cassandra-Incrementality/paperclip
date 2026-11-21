@@ -11339,7 +11339,7 @@ export function issueRoutes(
     // transaction (see assertRequestConfirmationTargetIsCurrent). We deliberately
     // do not pre-check the revision here: a separate route-level read would be
     // non-atomic with the insert and only duplicate the service gate.
-    const interaction = await issueThreadInteractionService(db).create(issue, {
+    const interaction = await issueThreadInteractionService(db, { wakeup: heartbeat.wakeup }).create(issue, {
       ...req.body,
       sourceRunId: req.actor.type === "agent" ? agentSourceRunId : req.body.sourceRunId ?? null,
     }, {

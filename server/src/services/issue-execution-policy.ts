@@ -1104,9 +1104,17 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
         clearedAt: new Date(),
       });
     } else {
+      // An explicit update always carries a genuinely different monitor spec
+      // (an identical resend has monitorChanged: false upstream and never
+      // reaches here with monitorExplicitlyUpdated: true) -- it is a fresh
+      // monitor, not a continuation of the one it replaces, so its own
+      // attempt history starts at 0. Reusing the replaced monitor's
+      // attemptCount here made an exhausted monitor permanently
+      // unreplaceable: any write bounced off bounds set by a schedule the
+      // caller was in the middle of discarding (PPC-7997).
       const exhaustedReason = exhaustedMonitorClearReason({
         monitor: input.policy.monitor,
-        attemptCount: currentMonitorState?.attemptCount ?? 0,
+        attemptCount: input.monitorExplicitlyUpdated ? 0 : currentMonitorState?.attemptCount ?? 0,
         now: new Date(),
       });
       if (exhaustedReason) {
@@ -1126,7 +1134,13 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
         patch.monitorWakeRequestedAt = null;
         patch.monitorNotes = input.policy.monitor.notes ?? null;
         patch.monitorScheduledBy = input.policy.monitor.scheduledBy;
-        targetMonitorState = buildScheduledMonitorState(currentMonitorState, input.policy.monitor);
+        // Same fresh-start rule as the exhaustion check above: an explicit
+        // update is a new monitor, so it does not inherit the replaced
+        // monitor's attempt/trigger history.
+        targetMonitorState = buildScheduledMonitorState(
+          input.monitorExplicitlyUpdated ? null : currentMonitorState,
+          input.policy.monitor,
+        );
       }
     }
   } else if (previousPolicy?.monitor) {

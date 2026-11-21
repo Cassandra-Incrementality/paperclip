@@ -1760,7 +1760,18 @@ describe("issue execution policy transitions", () => {
       ).toThrow("Monitor can only be scheduled");
     });
 
-    it("rejects explicitly re-arming a monitor after max attempts are exhausted", () => {
+    // Previously this threw "Monitor bounds are already exhausted": an
+    // explicit re-arm inherited the replaced monitor's attemptCount, so once
+    // a monitor used up its budget no later write -- fresh policy or an
+    // explicit clear-then-reschedule -- could ever succeed, because every
+    // write-path that preserves history (buildClearedMonitorState included)
+    // carried the same exhausted count forward. That made an exhausted
+    // monitor permanently unreplaceable rather than merely rate-limited
+    // against silent/automatic re-scheduling (PPC-7997). An explicit update
+    // is, by construction, a deliberate request for a different monitor (an
+    // identical resend never reaches here -- monitorChanged is false
+    // upstream), so it is honored as a fresh monitor starting at attempt 0.
+    it("honors an explicit re-arm after max attempts are exhausted as a fresh monitor", () => {
       const policy = normalizeIssueExecutionPolicy({
         stages: [],
         monitor: {
@@ -1770,27 +1781,30 @@ describe("issue execution policy transitions", () => {
         },
       })!;
 
-      expect(() =>
-        applyIssueExecutionPolicyTransition({
-          issue: {
-            status: "in_review",
-            assigneeAgentId: coderAgentId,
-            assigneeUserId: null,
-            executionPolicy: null,
-            executionState: null,
-            monitorAttemptCount: 1,
-            monitorNextCheckAt: null,
-            monitorLastTriggeredAt: null,
-            monitorNotes: null,
-            monitorScheduledBy: "assignee",
-          },
-          policy,
-          previousPolicy: null,
-          requestedAssigneePatch: {},
-          actor: { agentId: coderAgentId },
-          monitorExplicitlyUpdated: true,
-        }),
-      ).toThrow("Monitor bounds are already exhausted");
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: null,
+          executionState: null,
+          monitorAttemptCount: 1,
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: null,
+          monitorNotes: null,
+          monitorScheduledBy: "assignee",
+        },
+        policy,
+        previousPolicy: null,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: true,
+      });
+
+      expect(result.patch.monitorNextCheckAt).toEqual(new Date("2099-04-11T12:30:00.000Z"));
+      expect(result.patch.executionState).toMatchObject({
+        monitor: { status: "scheduled", attemptCount: 0 },
+      });
     });
   });
 });
@@ -2082,6 +2096,75 @@ describe("review round circuit breaker", () => {
       status: "pending",
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 1,
+    });
+  });
+
+  // PPC-7997: withdrawing a monitored interaction left the issue's monitor at
+  // nextCheckAt in the future with an attemptCount already at (or made to
+  // exceed, by a smaller replacement maxAttempts) its own bounds. Every
+  // attempt to repair it from the owning run -- replace with a fresh policy,
+  // or clear it outright -- must succeed; only the background scheduler tick
+  // that naturally reaches an exhausted monitor should ever report the bounds
+  // as exhausted.
+  describe("monitor explicit updates against an exhausted persisted state (#7997)", () => {
+    const exhaustedIssue = {
+      status: "in_progress",
+      assigneeAgentId: coderAgentId,
+      assigneeUserId: null,
+      executionPolicy: null,
+      executionState: null,
+      // Persisted monitor: still "scheduled" (nextCheckAt in the future) but
+      // attemptCount already at its own maxAttempts -- the exact zombie state
+      // from the bug report (status: scheduled, attempt 3 of 6, clearReason: null).
+      monitorNextCheckAt: new Date("2026-11-21T09:30:14.011Z"),
+      monitorAttemptCount: 3,
+      monitorNotes: "poll withdrawn interaction 64612f2d",
+      monitorScheduledBy: "assignee",
+    };
+
+    it("replaces an exhausted monitor with a fresh explicit policy instead of throwing", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: exhaustedIssue,
+        policy: normalizeIssueExecutionPolicy({
+          monitor: {
+            nextCheckAt: "2026-11-22T09:30:00.000Z",
+            maxAttempts: 3,
+            notes: "fresh monitor after withdraw",
+          },
+          stages: [],
+        }),
+        previousPolicy: normalizeIssueExecutionPolicy({
+          monitor: { nextCheckAt: "2026-11-21T09:30:14.011Z", maxAttempts: 6 },
+          stages: [],
+        }),
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: true,
+      });
+
+      expect(result.patch.monitorNextCheckAt).toEqual(new Date("2026-11-22T09:30:00.000Z"));
+      expect(result.patch.executionState).toMatchObject({
+        monitor: { status: "scheduled", attemptCount: 0 },
+      });
+    });
+
+    it("clears an exhausted monitor on an explicit monitor: null", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: exhaustedIssue,
+        policy: null,
+        previousPolicy: normalizeIssueExecutionPolicy({
+          monitor: { nextCheckAt: "2026-11-21T09:30:14.011Z", maxAttempts: 6 },
+          stages: [],
+        }),
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: true,
+      });
+
+      expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "manual" },
+      });
     });
   });
 });

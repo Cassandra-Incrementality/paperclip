@@ -1288,6 +1288,91 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(interactions.find((interaction) => interaction.id === otherKind.id)?.status).toBe("pending");
   });
 
+  it("wakes the superseded card's own creator instead of destroying it silently (PPC-7997)", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Supersede wakes the superseded creator");
+    const creatorAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "Creator",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const wakeCalls: Array<{ agentId: string; options: unknown }> = [];
+    const wakingSvc = issueThreadInteractionService(db, {
+      wakeup: async (agentId, options) => {
+        wakeCalls.push({ agentId, options });
+        return undefined;
+      },
+    });
+
+    const older = await wakingSvc.create({ id: issueId, companyId }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: { version: 1, prompt: "Withdraw the published 3.47x ROI?" },
+    }, { agentId: creatorAgentId });
+    const replacement = await wakingSvc.create({ id: issueId, companyId }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: { version: 1, prompt: "Withdraw the published 3.47x ROI? (updated numbers)" },
+    }, { agentId: creatorAgentId });
+
+    expect(wakeCalls).toHaveLength(1);
+    expect(wakeCalls[0]?.agentId).toBe(creatorAgentId);
+    expect(wakeCalls[0]?.options).toMatchObject({
+      reason: "issue_commented",
+      payload: {
+        issueId,
+        interactionId: older.id,
+        interactionStatus: "expired",
+        resolutionSource: "superseded_by_newer_request",
+        supersededByInteractionId: replacement.id,
+      },
+    });
+  });
+
+  it("does not wake on self-supersede when continuationPolicy opts out of it", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Supersede respects continuationPolicy");
+    const creatorAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "Creator",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const wakeCalls: unknown[] = [];
+    const wakingSvc = issueThreadInteractionService(db, {
+      wakeup: async (agentId, options) => {
+        wakeCalls.push({ agentId, options });
+        return undefined;
+      },
+    });
+
+    await wakingSvc.create({ id: issueId, companyId }, {
+      kind: "request_confirmation",
+      continuationPolicy: "none",
+      payload: { version: 1, prompt: "Draft one" },
+    }, { agentId: creatorAgentId });
+    await wakingSvc.create({ id: issueId, companyId }, {
+      kind: "request_confirmation",
+      continuationPolicy: "none",
+      payload: { version: 1, prompt: "Draft two" },
+    }, { agentId: creatorAgentId });
+
+    expect(wakeCalls).toHaveLength(0);
+  });
+
   it("supersedes an agent's own older pending ask_user_questions without crossing agent, kind, or issue", async () => {
     const { companyId, goalId, issueId } = await seedConfirmationIssue("Question supersedes older sibling");
     const otherIssueId = randomUUID();
