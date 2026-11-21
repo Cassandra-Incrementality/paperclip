@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statfsSync, statSync, unlinkSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -28,6 +28,15 @@ export type RunDatabaseBackupOptions = {
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
   backupEngine?: "auto" | "pg_dump" | "javascript";
+  /**
+   * Minimum free space, in bytes, required on the volume holding `backupDir`
+   * before a dump is attempted. Unset disables the guard (existing CLI/test
+   * callers are unaffected). PPC-7987: a full-disk dump attempt is what turned
+   * a retention regression into a 7h outage — statfs probe failures fail
+   * open (proceed with the dump) rather than block backups on an unrelated
+   * platform/permission issue.
+   */
+  minFreeBytes?: number;
 };
 
 export type RunDatabaseBackupResult = {
@@ -524,6 +533,32 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
   };
 }
 
+export class InsufficientBackupDiskSpaceError extends Error {
+  constructor(public readonly freeBytes: number, public readonly minFreeBytes: number, backupDir: string) {
+    super(
+      `Skipping database backup: ${formatGiB(freeBytes)} GiB free on the volume holding ${backupDir}, ` +
+        `below the ${formatGiB(minFreeBytes)} GiB floor`,
+    );
+    this.name = "InsufficientBackupDiskSpaceError";
+  }
+}
+
+function formatGiB(bytes: number): string {
+  return (bytes / 1024 ** 3).toFixed(1);
+}
+
+// Fails open (returns null, i.e. "don't block") on any statfs error — a
+// probe failure (unsupported platform, permission issue on the mount point)
+// must never itself block a backup that would otherwise have succeeded.
+function freeBytesOrNull(targetDir: string): number | null {
+  try {
+    const stats = statfsSync(targetDir);
+    return stats.bavail * stats.bsize;
+  } catch {
+    return null;
+  }
+}
+
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
   const filenamePrefix = opts.filenamePrefix ?? "paperclip";
   const retention = opts.retention;
@@ -540,6 +575,13 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await sql.end();
   };
   mkdirSync(opts.backupDir, { recursive: true });
+  if (opts.minFreeBytes !== undefined) {
+    const freeBytes = freeBytesOrNull(opts.backupDir);
+    if (freeBytes !== null && freeBytes < opts.minFreeBytes) {
+      await closeSql();
+      throw new InsufficientBackupDiskSpaceError(freeBytes, opts.minFreeBytes, opts.backupDir);
+    }
+  }
   const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
   const backupFile = `${sqlFile}.gz`;
   const writer = createBufferedTextFileWriter(sqlFile);

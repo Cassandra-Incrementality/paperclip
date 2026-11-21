@@ -4,7 +4,12 @@ import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  InsufficientBackupDiskSpaceError,
+  runDatabaseBackup,
+  runDatabaseRestore,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -72,6 +77,30 @@ describe("createBufferedTextFileWriter", () => {
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
   });
+});
+
+describe("runDatabaseBackup minFreeBytes guard", () => {
+  it(
+    "skips the dump instead of attempting it when free space is below the floor (PPC-7987)",
+    async () => {
+      const backupDir = createTempDir("paperclip-db-backup-guard-");
+
+      // No real postgres needed: the guard must trip before the connection
+      // is ever used, so an unreachable connection string proves that.
+      await expect(
+        runDatabaseBackup({
+          connectionString: "postgres://unreachable:unreachable@127.0.0.1:1/nonexistent",
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-test",
+          minFreeBytes: Number.MAX_SAFE_INTEGER,
+        }),
+      ).rejects.toThrow(InsufficientBackupDiskSpaceError);
+
+      expect(fs.readdirSync(backupDir)).toEqual([]);
+    },
+    10_000,
+  );
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {

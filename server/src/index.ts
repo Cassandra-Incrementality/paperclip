@@ -718,6 +718,16 @@ export async function startServer(): Promise<StartedServer> {
     Number(process.env.PAPERCLIP_DB_BACKUP_MAX_AGE_HOURS) ||
       Math.max(26, Math.ceil((config.databaseBackupIntervalMinutes / 60) * 2)),
   );
+  // PPC-7987: skip the scheduled dump rather than let it run the volume to
+  // 0 bytes free when retention/cadence configuration drifts out of sync
+  // with disk size again. Matches scripts/backup.sh's own
+  // LOCAL_PG_BACKUPS_EMERGENCY_FREE_GIB floor so both layers agree on what
+  // "critically low" means.
+  const DATABASE_BACKUP_MIN_FREE_GIB = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_DB_BACKUP_MIN_FREE_GIB) || 25,
+  );
+  const DATABASE_BACKUP_MIN_FREE_BYTES = DATABASE_BACKUP_MIN_FREE_GIB * 1024 ** 3;
   const databaseBackupAlertFile =
     process.env.PAPERCLIP_DB_BACKUP_ALERT_FILE ||
     resolve(config.databaseBackupDir, "..", "health", "db-backup-to-s3.failure");
@@ -754,6 +764,11 @@ export async function startServer(): Promise<StartedServer> {
         backupDir: config.databaseBackupDir,
         retention,
         filenamePrefix: "paperclip",
+        // PPC-7987: the scheduled hourly backup is what turned a retention
+        // regression into a 7h ENOSPC outage on 11-20. Only the unattended
+        // path gets this floor — a human running a manual/CLI backup already
+        // knows the disk state they're acting on.
+        minFreeBytes: DATABASE_BACKUP_MIN_FREE_BYTES,
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
@@ -1771,6 +1786,7 @@ export async function startServer(): Promise<StartedServer> {
       {
         intervalMinutes: config.databaseBackupIntervalMinutes,
         retentionSource: "instance-settings-db",
+        minFreeGiB: DATABASE_BACKUP_MIN_FREE_GIB,
         backupDir: config.databaseBackupDir,
       },
       "Automatic database backups enabled",
