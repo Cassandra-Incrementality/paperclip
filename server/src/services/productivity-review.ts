@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
 import {
@@ -8,7 +8,9 @@ import {
   costEvents,
   heartbeatRuns,
   issueComments,
+  issueRelations,
   issues,
+  issueThreadInteractions,
   projects,
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -253,6 +255,44 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       depth += 1;
     }
     return false;
+  }
+
+  // A long active-episode clock is wall-clock only; it cannot see that the issue is
+  // already parked on a live continuation path (PPC-8072). Those paths explain the
+  // elapsed time, so long_active_duration must not fire while one is live.
+  async function hasLiveContinuationPath(sourceIssue: IssueRow, now: Date) {
+    if (sourceIssue.monitorNextCheckAt && sourceIssue.monitorNextCheckAt.getTime() > now.getTime()) {
+      return true;
+    }
+    const [pendingInteraction, unresolvedBlocker] = await Promise.all([
+      db
+        .select({ id: issueThreadInteractions.id })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            eq(issueThreadInteractions.companyId, sourceIssue.companyId),
+            eq(issueThreadInteractions.issueId, sourceIssue.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0),
+      db
+        .select({ blockerIssueId: issueRelations.issueId })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, sourceIssue.companyId),
+            eq(issueRelations.type, "blocks"),
+            eq(issueRelations.relatedIssueId, sourceIssue.id),
+            ne(issues.status, "done"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0),
+    ]);
+    return pendingInteraction || unresolvedBlocker;
   }
 
   async function findOpenProductivityReview(companyId: string, sourceIssueId: string) {
@@ -547,7 +587,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    const wallClockLongActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    const longActive = wallClockLongActive && !(await hasLiveContinuationPath(sourceIssue, now));
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||

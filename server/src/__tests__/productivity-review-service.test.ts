@@ -8,7 +8,9 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueRelations,
   issues,
+  issueThreadInteractions,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -503,6 +505,102 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
     expect(review?.priority).toBe("medium");
     expect(hold.held).toBe(false);
+  });
+
+  it("suppresses a long-active review while an armed monitor is still in the future", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(now.getTime() + 60 * 60 * 1000) })
+      .where(eq(issues.id, seeded.issueId));
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("reviews a long-active issue once its armed monitor has passed", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(now.getTime() - 60 * 60 * 1000) })
+      .where(eq(issues.id, seeded.issueId));
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+  });
+
+  it("suppresses a long-active review while a pending interaction is open", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      createdByAgentId: seeded.coderId,
+      payload: { version: 1, prompt: "Ship this change?" },
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("suppresses a long-active review while an unresolved blocker is open", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId: seeded.companyId,
+      title: "Upstream dependency",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: seeded.coderId,
+      originKind: "manual",
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      createdAt: seeded.createdAt,
+      updatedAt: seeded.createdAt,
+    });
+    await db.insert(issueRelations).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: seeded.issueId,
+      type: "blocks",
+    });
+    const service = productivityReviewService(db);
+
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    expect(result.scanned).toBe(2);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
   it("skips a long-active candidate while its assignee is paused and reviews it once unpaused", async () => {
