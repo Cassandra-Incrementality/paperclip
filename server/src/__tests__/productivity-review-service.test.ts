@@ -543,6 +543,33 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(1);
   });
 
+  it("stops refreshing an already-open long-active review once a continuation path appears", async () => {
+    const createdAt = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(createdAt.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const service = productivityReviewService(db);
+
+    const firstPass = await service.reconcileProductivityReviews({ now: createdAt, companyId: seeded.companyId });
+    expect(firstPass.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review).toBeDefined();
+
+    // Past the refresh interval, so a refresh would fire if evidence were still generated.
+    const later = new Date(createdAt.getTime() + DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS + 60_000);
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date(later.getTime() + 60 * 60 * 1000) })
+      .where(eq(issues.id, seeded.issueId));
+
+    const secondPass = await service.reconcileProductivityReviews({ now: later, companyId: seeded.companyId });
+
+    expect(secondPass.updated).toBe(0);
+    expect(secondPass.skipped).toBe(1);
+    expect(await listRefreshComments(review!.id)).toHaveLength(0);
+  });
+
   it("suppresses a long-active review while a pending interaction is open", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
