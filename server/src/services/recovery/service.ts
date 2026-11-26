@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, not, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, not, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -95,6 +95,19 @@ import {
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
+// PPC-8439: a deferred_issue_execution row older than this with no live run left
+// to promote it is always orphaned — the promotion loop
+// (releaseIssueExecutionAndPromote) is the only thing that ever resolves these
+// rows, and it is keyed to the specific run that held the lock. An interrupted
+// run that never reaches it, or a lock that was already cleared by the time the
+// finalizing run looked for it, leaves the row behind with nothing watching it.
+const DEFERRED_WAKE_ORPHAN_TTL_MS = 60 * 60 * 1000;
+// PPC-8439: a `queued` heartbeat run that never reached `startedAt` this long
+// after creation was abandoned before dispatch (e.g. a coalesced duplicate, or
+// the dispatcher restarting before claiming it) — it holds no lock and nothing
+// is waiting on it, but it inflates status=='running' readings on liveness
+// checks that key on "any non-terminal run" without inspecting startedAt.
+const ABANDONED_QUEUED_RUN_TTL_MS = 24 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
@@ -5880,6 +5893,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       issueIds: [] as string[],
       terminalizedRunIds: [] as string[],
       orphanedDeferredWakeIds: [] as string[],
+      abandonedQueuedRunIds: [] as string[],
     };
 
     const candidates = await db
@@ -6074,10 +6088,112 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
     }
 
+    // PPC-8439: the PPC-4397 branch above only terminalizes a deferred wake when
+    // THIS sweep is the one clearing the issue's lock columns. It never fires
+    // when the issue has no lock at all by the time the sweep runs — e.g. the
+    // run that held it finalized through releaseIssueExecutionAndPromote
+    // without successfully promoting the deferred row, or an interrupted run
+    // never reached that promotion path. Independently sweep every
+    // deferred_issue_execution row old enough to rule out "still legitimately
+    // waiting its turn" and confirm no live run anywhere could still promote
+    // it, regardless of whether this pass touched its issue's lock columns.
+    const staleDeferredCandidates = await db
+      .select({
+        id: agentWakeupRequests.id,
+        companyId: agentWakeupRequests.companyId,
+        issueId: sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          lt(agentWakeupRequests.createdAt, new Date(Date.now() - DEFERRED_WAKE_ORPHAN_TTL_MS)),
+        ),
+      );
+
+    for (const candidate of staleDeferredCandidates) {
+      if (!candidate.issueId) continue;
+
+      const liveRun = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, candidate.companyId),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${candidate.issueId}`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (liveRun) continue; // genuinely still waiting its turn — leave it alone
+
+      const updated = await db
+        .update(agentWakeupRequests)
+        .set({
+          status: "failed",
+          finishedAt: new Date(),
+          error:
+            "Deferred wake orphaned: no live run references this issue and the wake has sat past the staleness window with nothing left to promote it (PPC-8439)",
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, candidate.id),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id })
+        .then((rows) => rows[0] ?? null);
+
+      if (!updated) continue;
+
+      result.orphanedDeferredWakeIds.push(updated.id);
+
+      await logActivity(db, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.stale_deferred_wake_terminalized",
+        entityType: "issue",
+        entityId: candidate.issueId,
+        details: {
+          source: "recovery.sweep_stale_issue_locks.orphan_without_lock",
+          terminalizedWakeupRequestIds: [updated.id],
+        },
+      });
+    }
+
+    // PPC-8439 (secondary): a `queued` run that never reached `startedAt` was
+    // abandoned before dispatch and holds no lock, but it still reads as a
+    // live execution path to any check keyed on "non-terminal run status"
+    // without also checking startedAt. Age these out in the same sweep.
+    const abandonedQueuedRuns = await db
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        finishedAt: new Date(),
+        error: "Abandoned before dispatch: queued run never started within the staleness window (PPC-8439)",
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.status, "queued"),
+          isNull(heartbeatRuns.startedAt),
+          lt(heartbeatRuns.createdAt, new Date(Date.now() - ABANDONED_QUEUED_RUN_TTL_MS)),
+        ),
+      )
+      .returning({ id: heartbeatRuns.id });
+
+    result.abandonedQueuedRunIds.push(...abandonedQueuedRuns.map((row) => row.id));
+
     if (
       result.cleared > 0 ||
       result.terminalizedRunIds.length > 0 ||
-      result.orphanedDeferredWakeIds.length > 0
+      result.orphanedDeferredWakeIds.length > 0 ||
+      result.abandonedQueuedRunIds.length > 0
     ) {
       logger.warn(
         {
@@ -6085,6 +6201,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           issueIds: result.issueIds,
           terminalizedRunIds: result.terminalizedRunIds,
           orphanedDeferredWakeIds: result.orphanedDeferredWakeIds,
+          abandonedQueuedRunIds: result.abandonedQueuedRunIds,
         },
         "swept stale issue lock columns",
       );

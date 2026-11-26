@@ -817,4 +817,179 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .then((rows) => rows[0]);
     expect(wake?.status).toBe("deferred_issue_execution");
   });
+
+  it("terminalizes a deferred_issue_execution wake whose issue never held a lock, once no live run remains (PPC-8439)", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "No lock at all — the run that held it already released cleanly",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const deferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      payload: { issueId },
+      createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      updatedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.cleared).toBe(0);
+    expect(result.orphanedDeferredWakeIds).toEqual([deferredWakeId]);
+
+    const wake = await db
+      .select({ status: agentWakeupRequests.status, error: agentWakeupRequests.error })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0]);
+    expect(wake?.status).toBe("failed");
+    expect(wake?.error).toContain("PPC-8439");
+  });
+
+  it("does not touch a lockless deferred_issue_execution wake younger than the staleness window", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "No lock, but the wake was only just parked",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const deferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      payload: { issueId },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.orphanedDeferredWakeIds).toEqual([]);
+
+    const wake = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0]);
+    expect(wake?.status).toBe("deferred_issue_execution");
+  });
+
+  it("does not touch a stale lockless deferred_issue_execution wake while a live run still references its issue (PPC-8439)", async () => {
+    const { companyId, agentId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "No lock column set, but a run is still genuinely working this issue",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const liveRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: liveRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "manual",
+      contextSnapshot: { issueId },
+    });
+
+    const deferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "automation",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      payload: { issueId },
+      createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+      updatedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.orphanedDeferredWakeIds).toEqual([]);
+
+    const wake = await db
+      .select({ status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0]);
+    expect(wake?.status).toBe("deferred_issue_execution");
+  });
+
+  it("cancels an abandoned queued heartbeat run that never started within the staleness window (PPC-8439)", async () => {
+    const { companyId, agentId } = await seed();
+    const abandonedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: abandonedRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "manual",
+      createdAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.abandonedQueuedRunIds).toEqual([abandonedRunId]);
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, error: heartbeatRuns.error, finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, abandonedRunId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.error).toContain("PPC-8439");
+    expect(run?.finishedAt).not.toBeNull();
+  });
+
+  it("does not cancel a queued run that is still within the abandonment staleness window", async () => {
+    const { companyId, agentId } = await seed();
+    const freshQueuedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: freshQueuedRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "manual",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.abandonedQueuedRunIds).toEqual([]);
+
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, freshQueuedRunId))
+      .then((rows) => rows[0]);
+    expect(run?.status).toBe("queued");
+  });
 });
