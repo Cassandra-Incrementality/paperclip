@@ -284,7 +284,7 @@ function issueAllowsMonitor(status: string, assigneeAgentId: string | null, assi
   return Boolean(assigneeAgentId) && !assigneeUserId && (status === "in_progress" || status === "in_review");
 }
 
-function monitorClearReasonForIssue(
+export function monitorClearReasonForIssue(
   status: string,
   assigneeAgentId: string | null,
   assigneeUserId: string | null,
@@ -1140,6 +1140,22 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
           : monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId) ?? "manual",
       clearedAt: new Date(),
     });
+  } else if (currentMonitorState && currentMonitorState.status !== "cleared") {
+    // A monitor that has already triggered at least once has executionPolicy.monitor
+    // stripped (buildIssueMonitorTriggeredPatch), so neither branch above observes it —
+    // but monitorNextCheckAt/executionState.monitor still carry a live clock. Without
+    // this, a status-changing PATCH on an issue whose monitor already fired once never
+    // notices the clock and the issue strands as a zombie monitor forever (PPC-8474).
+    const zombieClearReason = monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId);
+    if (zombieClearReason) {
+      patch.monitorNextCheckAt = null;
+      patch.monitorWakeRequestedAt = null;
+      targetMonitorState = buildClearedMonitorState({
+        previous: currentMonitorState,
+        clearReason: zombieClearReason,
+        clearedAt: new Date(),
+      });
+    }
   }
 
   if (stagePatch.executionState !== undefined || !monitorStatesEqual(currentMonitorState, targetMonitorState)) {

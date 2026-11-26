@@ -1733,6 +1733,66 @@ describe("issue execution policy transitions", () => {
       });
     });
 
+    it("force-clears a zombie monitor on close even after executionPolicy.monitor was already stripped by a prior trigger (PPC-8474)", () => {
+      // Once a monitor has fired at least once, the dispatcher strips
+      // executionPolicy.monitor to null (stripMonitorFromExecutionPolicy) and
+      // keeps the live clock going via the raw monitorNextCheckAt column plus
+      // executionState.monitor alone. A plain status-only PATCH to "done"
+      // therefore arrives with both `policy.monitor` and `previousPolicy.monitor`
+      // already null — the two existing branches above never fire, and the
+      // issue strands as a zombie monitor that keeps ticking forever even
+      // though it is `done` (measured on PPC-1298: attemptCount climbed 9 -> 108
+      // with zero board approval).
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: null,
+          executionState: {
+            status: "idle",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            monitor: {
+              status: "scheduled",
+              nextCheckAt: "2026-11-26T17:00:00.000Z",
+              lastTriggeredAt: "2026-11-26T16:30:00.000Z",
+              attemptCount: 108,
+              notes: "Check deployment",
+              scheduledBy: "assignee",
+              clearedAt: null,
+              clearReason: null,
+            },
+          },
+          monitorAttemptCount: 108,
+          monitorNextCheckAt: new Date("2026-11-26T17:00:00.000Z"),
+          monitorLastTriggeredAt: new Date("2026-11-26T16:30:00.000Z"),
+          monitorNotes: "Check deployment",
+          monitorScheduledBy: "assignee",
+        },
+        policy: null,
+        previousPolicy: null,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+      });
+
+      expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.monitorWakeRequestedAt).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        monitor: {
+          status: "cleared",
+          clearReason: "done",
+        },
+      });
+    });
+
     it("rejects explicitly scheduling a monitor on an invalid issue state", () => {
       const policy = normalizeIssueExecutionPolicy({
         stages: [],
